@@ -1,12 +1,15 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import date, datetime, timedelta
 import calendar
 from typing import Tuple, List, Dict, Any
-import ast  # for parsing stored strength history
+import ast
+import xml.etree.ElementTree as ET
+from openai import OpenAI
 
 # ------------------------
-# CONFIG
+# CONFIG & FILE PATHS
 # ------------------------
 
 LOG_FILE = "training_log.csv"
@@ -29,6 +32,63 @@ BICEPS_ALTS = ["Primary (Biceps Curl)", "DB Curl", "Hammer Curl", "Band Curl"]
 CORE_ALTS = ["Primary (Core)", "Plank", "Side Plank", "Dead Bug"]
 
 ME_ALTS = ["Primary (Step-Ups)", "StairStepper", "Incline Grind (sustained)", "Ruck Walk", "Box Step Ladder"]
+
+# OpenAI client (expects OPENAI_API_KEY in Streamlit Secrets)
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+
+# ------------------------
+# AI COACH CHAT LOGIC
+# ------------------------
+
+def init_chat_state():
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = [
+            {
+                "role": "assistant",
+                "content": "Hey, I'm your AI coach. Ask me about today's workout, adjustments for soreness, or how to interpret your cardio data."
+            }
+        ]
+
+
+def add_ai_message(role: str, content: str):
+    st.session_state.ai_messages.append({"role": role, "content": content})
+
+
+def call_ai_coach(user_message: str) -> str:
+    """
+    Sends chat history + the new user_message to OpenAI and returns the assistant reply.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a concise, practical training coach. "
+                "You help the user interpret their workouts, adjust training for soreness, "
+                "and make decisions about runs, lifting, and recovery. "
+                "The user is training for the Tahoe Triathlon on August 29, 2026, cares about GBRS standards, "
+                "triathlon, hypertrophy, and uphill hiking. "
+                "Answer in short, clear paragraphs with specific recommendations."
+            ),
+        }
+    ]
+
+    for m in st.session_state.ai_messages:
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            max_tokens=400,
+            temperature=0.5,
+        )
+        reply = resp.choices[0].message.content
+        return reply
+    except Exception as e:
+        return f"Error talking to AI coach: {e}"
 
 
 # ------------------------
@@ -59,19 +119,105 @@ def is_workday(d: date) -> bool:
 
 def update_work_schedule_for_month(year: int, month: int, selections: Dict[int, bool]) -> None:
     df = load_work_schedule()
-
-    # Remove existing entries for this month
     mask_same_month = df["date"].apply(lambda x: x.year == year and x.month == month)
     df = df[~mask_same_month]
 
-    # Add new entries for month
-    new_rows = []
-    for day, work_flag in selections.items():
-        new_rows.append({"date": date(year, month, day), "is_work": work_flag})
+    new_rows = [{"date": date(year, month, day), "is_work": flag} for day, flag in selections.items()]
     if new_rows:
         df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
 
     save_work_schedule(df)
+
+
+# ------------------------
+# TCX PARSING
+# ------------------------
+
+def parse_tcx(file_obj):
+    """
+    Parses a TCX file and returns a dict with:
+    duration_sec, distance_m, avg_hr, max_hr, avg_cadence, elevation_gain_m,
+    pace_min_per_km, hr_drift
+    """
+    tree = ET.parse(file_obj)
+    root = tree.getroot()
+
+    ns = {"tcx": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"}
+    tps = root.findall(".//tcx:Trackpoint", ns)
+
+    times, hrs, cadence, altitude, distance = [], [], [], [], []
+
+    for tp in tps:
+        t = tp.find("tcx:Time", ns)
+        hr = tp.find(".//tcx:HeartRateBpm/tcx:Value", ns)
+        cad = tp.find(".//tcx:Cadence", ns)
+        alt = tp.find(".//tcx:AltitudeMeters", ns)
+        dist = tp.find(".//tcx:DistanceMeters", ns)
+
+        if t is not None:
+            try:
+                times.append(datetime.fromisoformat(t.text.replace("Z", "+00:00")))
+            except Exception:
+                pass
+        if hr is not None:
+            try:
+                hrs.append(float(hr.text))
+            except Exception:
+                pass
+        if cad is not None:
+            try:
+                cadence.append(float(cad.text))
+            except Exception:
+                pass
+        if alt is not None:
+            try:
+                altitude.append(float(alt.text))
+            except Exception:
+                pass
+        if dist is not None:
+            try:
+                distance.append(float(dist.text))
+            except Exception:
+                pass
+
+    if not times:
+        return None
+
+    duration_sec = (times[-1] - times[0]).total_seconds()
+    distance_m = distance[-1] if distance else 0.0
+    avg_hr = sum(hrs) / len(hrs) if hrs else 0.0
+    max_hr = max(hrs) if hrs else 0.0
+    avg_cad = sum(cadence) / len(cadence) if cadence else 0.0
+
+    elevation_gain = 0.0
+    for i in range(1, len(altitude)):
+        diff = altitude[i] - altitude[i - 1]
+        if diff > 0:
+            elevation_gain += diff
+
+    if distance_m > 0:
+        pace_min_per_km = (duration_sec / 60.0) / (distance_m / 1000.0)
+    else:
+        pace_min_per_km = 0.0
+
+    half = len(hrs) // 2
+    if half > 0:
+        first = sum(hrs[:half]) / half
+        second = sum(hrs[half:]) / (len(hrs) - half)
+        hr_drift = (second - first) / first if first > 0 else 0.0
+    else:
+        hr_drift = 0.0
+
+    return {
+        "duration_sec": duration_sec,
+        "distance_m": distance_m,
+        "avg_hr": avg_hr,
+        "max_hr": max_hr,
+        "avg_cadence": avg_cad,
+        "elevation_gain_m": elevation_gain,
+        "pace_min_per_km": pace_min_per_km,
+        "hr_drift": hr_drift,
+    }
 
 
 # ------------------------
@@ -84,7 +230,7 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
     kind drives UI: StrengthA, StrengthB, Tempo, Hill, FlexCardio,
     LongZ2, Incline, ME, TriBrick, TriRaceLike, Off, Manual
     """
-    dt = d  # pure date
+    dt = d
 
     # Macro dates for 2025–26
     start_2a = date(2025, 12, 8)
@@ -118,101 +264,96 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
 
     dow = dt.weekday()  # Mon=0
 
-    # --- Helper functions for rich cardio descriptions ---
+    # Helper descriptions
     def tempo_run_desc():
         return (
             "Tempo Run — 30–35 minutes\n\n"
             "• Warm-up: 5–10 min easy Z1–low Z2 jog or brisk walk.\n"
-            "• Main Set: 2–3 × 6–8 min at controlled tempo (RPE 6–7, comfortably hard), "
+            "• Main Set: 2–3 × 6–8 min at controlled tempo (RPE 6–7), "
             "with 2–3 min easy Z1–Z2 between reps.\n"
             "• Cool-down: 5–10 min easy.\n\n"
-            "Goal: Build aerobic power and running economy without going into a race effort.\n"
-            "Coaching Tip: Stay relaxed in shoulders and jaw, and aim for a smooth, repeatable cadence."
+            "Goal: Build aerobic power and running economy.\n"
+            "Coaching Tip: Relax shoulders/jaw and keep cadence smooth."
         )
 
     def long_z2_desc(mode: str = "Bike/Run"):
         return (
             f"Long Z2 {mode} — 75–90 minutes\n\n"
             "• Warm-up: 10 min easy Z1.\n"
-            "• Main Set: 60–70 min steady Z2 (RPE 4–6). You should be able to talk in full sentences.\n"
-            "• Cool-down: 5–10 min very easy.\n\n"
-            "Goal: Build your base engine and fat-burning capacity.\n"
-            "Coaching Tip: Think 'smooth and boring.' If it feels exciting, you're probably going too hard."
+            "• Main: 60–70 min steady Z2 (RPE 4–6).\n"
+            "• Cool-down: 5–10 min easy.\n\n"
+            "Goal: Build base engine and fat-burning capacity.\n"
+            "Coaching Tip: If it feels exciting, you're probably going too hard."
         )
 
     def flex_z2_desc():
         return (
             "Flexible Z2 Cardio — 30–45 minutes\n\n"
-            "• Choose: Run, Bike, or Incline Walk depending on fatigue and joints.\n"
-            "• Stay in easy Z2 (RPE 3–5) where breathing is steady and controlled.\n\n"
-            "Goal: Maintain aerobic volume without digging a recovery hole.\n"
-            "Coaching Tip: This is the day to respect soreness and travel fatigue. Err on the easier side."
+            "• Choose: Run, Bike, or Incline Walk.\n"
+            "• Stay in easy Z2 (RPE 3–5).\n\n"
+            "Goal: Maintain aerobic volume without digging a hole.\n"
+            "Coaching Tip: Let fatigue and joints decide the modality."
         )
 
     def incline_desc(long: bool = False):
         if long:
             return (
                 "Long Incline / Hike — 60–90 minutes\n\n"
-                "• Continuous uphill walking or hiking at Z2 effort (RPE 4–6).\n"
-                "• Use treadmill incline or outdoor hills.\n\n"
-                "Goal: Build climbing-specific strength for hills and bike climbing.\n"
-                "Coaching Tip: Shorten your stride, lean slightly from the ankles, and keep breathing steady."
+                "• Continuous uphill walking/hiking in Z2.\n"
+                "Goal: Build climbing-specific strength.\n"
+                "Coaching Tip: Shorten stride and lean slightly from ankles."
             )
-        else:
-            return (
-                "Incline Z2 — 40–60 minutes\n\n"
-                "• Steady incline treadmill or outdoor uphill walking in Z2 (RPE 4–5).\n\n"
-                "Goal: Low-impact aerobic work that directly supports uphill running and bike climbing.\n"
-                "Coaching Tip: Let the incline, not speed, drive the difficulty. If HR creeps too high, slow down."
-            )
+        return (
+            "Incline Z2 — 40–60 minutes\n\n"
+            "• Steady incline treadmill or outdoor uphill walking in Z2.\n"
+            "Goal: Low-impact aerobic work for uphill strength.\n"
+            "Coaching Tip: Use incline, not speed, to set difficulty."
+        )
 
     def hill_hike_desc():
         return (
             "Hill Hike — 45–75 minutes\n\n"
-            "• Continuous or looped hiking on hills or stair machines, staying mostly in Z2.\n\n"
-            "Goal: Build leg strength and durability for climbs without pounding from running.\n"
-            "Coaching Tip: Keep steps deliberate and posture tall; don't sprint the hills, just grind steadily."
+            "• Continuous or looped hiking on hills/stairs in Z2.\n"
+            "Goal: Leg strength/durability for climbs.\n"
+            "Coaching Tip: Grind, don't sprint; keep breathing steady."
         )
 
     def me_desc():
         return (
             "Muscular Endurance Step-Ups + Easy Cardio\n\n"
             "• 3 rounds:\n"
-            "  – 6 minutes continuous step-ups with pack (moderate weight).\n"
-            "  – 2 minutes easy standing or slow walk recovery.\n"
-            "• Then: 20–25 minutes easy Z1–Z2 Run/Bike/Incline.\n\n"
-            "Goal: Build local muscular endurance in quads and glutes for climbing and bike power.\n"
-            "Coaching Tip: Smooth, controlled steps. No bouncing. Legs should burn; breathing stays controlled."
+            "  – 6 min continuous step-ups with pack.\n"
+            "  – 2 min easy.\n"
+            "• Then: 20–25 min easy Z1–Z2 cardio.\n\n"
+            "Goal: Local muscular endurance for climbs.\n"
+            "Coaching Tip: Smooth, controlled steps; legs burn, breathing steady."
         )
 
     def brick_desc(long: bool = False):
         if long:
             return (
                 "Long Brick — Bike → Run\n\n"
-                "• Bike: 60–90 min Z2 with short segments at race-like effort.\n"
-                "• Transition: 5–10 min quick change.\n"
-                "• Run: 15–25 min off the bike at easy–moderate pace (Z2–Z3-).\n\n"
-                "Goal: Teach your legs to run well off the bike and practice fueling.\n"
-                "Coaching Tip: First 5 minutes of the run should feel laughably easy—let your legs come to you."
+                "• Bike: 60–90 min Z2 with race-like segments.\n"
+                "• Transition: 5–10 min.\n"
+                "• Run: 15–25 min Z2–low Z3.\n\n"
+                "Goal: Run well off the bike and practice fueling.\n"
+                "Coaching Tip: First 5 min of run should feel too easy."
             )
-        else:
-            return (
-                "Brick — Bike → Run\n\n"
-                "• Bike: 30–45 min Z2–Z3-.\n"
-                "• Transition: quick change.\n"
-                "• Run: 10–15 min off the bike at easy–steady pace.\n\n"
-                "Goal: Groove the feel of running off the bike without huge fatigue.\n"
-                "Coaching Tip: Focus on cadence and relaxed upper body on the run; don't chase speed."
-            )
+        return (
+            "Brick — Bike → Run\n\n"
+            "• Bike: 30–45 min Z2–Z3-.\n"
+            "• Transition.\n"
+            "• Run: 10–15 min easy-steady.\n\n"
+            "Goal: Groove the feel of running off the bike.\n"
+            "Coaching Tip: Focus on cadence and relaxed upper body."
+        )
 
     def race_like_desc(modality: str):
         return (
             f"Race-Pace {modality}\n\n"
-            "• Short intervals at your target race effort with plenty of easy recovery.\n"
-            "• Total hard time is small; quality > quantity.\n\n"
-            "Goal: Lock in the feel of race pace and movement economy.\n"
-            "Coaching Tip: Ask yourself: 'Could I hold this on race day if conditions were good?' "
-            "If the answer is no, back it off slightly."
+            "• Short intervals at target race effort with plenty of easy recovery.\n\n"
+            "Goal: Lock in race-pace feel and movement economy.\n"
+            "Coaching Tip: If you couldn't hold it on race day, back it off."
         )
 
     # Phase 2A – Strength + Aerobic Base
@@ -222,218 +363,173 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
             planned = (
                 "Strength A – Upper Focus\n\n"
                 "• Bench Press, Pull-Ups, Incline Press, Row, Lateral Raises, Triceps.\n"
-                "• Optional: 5–10 min very easy cardio at the end.\n\n"
-                "Goal: Build upper-body strength and muscle to support overall performance and GBRS work.\n"
-                "Coaching Tip: Leave 1–3 reps in the tank on main lifts; this is not a max-out phase."
+                "Goal: Build upper-body strength and muscle.\n"
+                "Coaching Tip: Leave 1–3 reps in the tank on main lifts."
             )
             return phase, "Strength A – Upper Focus", planned, "StrengthA"
-        elif dow == 1:
+        if dow == 1:
             return phase, "Aerobic Tempo Run", tempo_run_desc(), "Tempo"
-        elif dow == 2:
+        if dow == 2:
             return phase, "Z2 Hill Hike", hill_hike_desc(), "Hill"
-        elif dow == 3:
+        if dow == 3:
             planned = (
                 "Strength B – Lower / Hypertrophy\n\n"
-                "• Deadlift/RDL, Split Squat or Lunge, Hip Thrust, Row Variation, Biceps, Core.\n\n"
-                "Goal: Build lower-body strength and muscle to support hills, biking and overall power.\n"
-                "Coaching Tip: Control the eccentric (lowering), and don't chase fatigue at the expense of form."
+                "• Deadlift/RDL, Split Squat/Lunge, Hip Thrust, Row Variation, Biceps, Core.\n"
+                "Goal: Lower-body strength and muscle.\n"
+                "Coaching Tip: Control the eccentric; no ugly grinders."
             )
             return phase, "Strength B – Lower/Hypertrophy", planned, "StrengthB"
-        elif dow == 4:
+        if dow == 4:
             return phase, "Aerobic Flex Day", flex_z2_desc(), "FlexCardio"
-        elif dow == 5:
+        if dow == 5:
             return phase, "Long Z2 Endurance", long_z2_desc("Bike/Run/Hike"), "LongZ2"
-        else:
-            planned = (
-                "Off / Recovery\n\n"
-                "• Rest, light mobility, optional very easy walk.\n\n"
-                "Goal: Absorb the week's work and show up fresh for key days.\n"
-                "Coaching Tip: If you're unsure whether to train, default to recovery here."
-            )
-            return phase, "Off / Recovery", planned, "Off"
+        planned = (
+            "Off / Recovery\n\n"
+            "Goal: Absorb the week's work.\n"
+            "Coaching Tip: If unsure whether to train, rest."
+        )
+        return phase, "Off / Recovery", planned, "Off"
 
-    # Phase 2B – Muscular Endurance (ME)
+    # Phase 2B – ME
     if start_2b <= dt <= end_2b:
         phase = "Phase 2B – Muscular Endurance"
         if dow == 0:
-            return phase, "Z2 Incline", incline_desc(long=False), "Incline"
-        elif dow == 1:
+            return phase, "Z2 Incline", incline_desc(False), "Incline"
+        if dow == 1:
             planned = (
-                "Strength A – Upper Focus (Slightly De-Emphasized)\n\n"
-                "• Bench, Pull-Ups, Incline, Row, Delts, Triceps.\n\n"
-                "Goal: Maintain and slightly build strength while ME takes priority.\n"
-                "Coaching Tip: Keep 2–3 reps in reserve and don't let this session crush your legs/central fatigue."
+                "Strength A – Upper (De-emphasized)\n\n"
+                "Goal: Maintain upper strength while ME is priority.\n"
+                "Coaching Tip: 2–3 reps in reserve; don't crush yourself."
             )
             return phase, "Strength A – Upper Focus", planned, "StrengthA"
-        elif dow == 2:
+        if dow == 2:
             return phase, "ME Step-Ups + Easy Cardio", me_desc(), "ME"
-        elif dow == 3:
-            return phase, "Z2 Incline", incline_desc(long=False), "Incline"
-        elif dow == 4:
+        if dow == 3:
+            return phase, "Z2 Incline", incline_desc(False), "Incline"
+        if dow == 4:
             planned = (
                 "Strength B – Lower (Light)\n\n"
-                "• Light Deadlift/RDL, Carries, Rear Delts, Biceps, Core.\n\n"
-                "Goal: Support ME work without overloading legs.\n"
-                "Coaching Tip: Treat this as 'movement practice' more than a 'crush yourself' day."
+                "Goal: Support ME without heavy fatigue.\n"
+                "Coaching Tip: Treat as movement practice."
             )
             return phase, "Strength B – Lower (Light)", planned, "StrengthB"
-        elif dow == 5:
-            return phase, "Long Incline / Hike", incline_desc(long=True), "LongZ2"
-        else:
-            planned = (
-                "Off / Recovery\n\n"
-                "• Rest, light mobility, optional walk.\n"
-                "Coaching Tip: If ME days are burying you, lean into this rest day."
-            )
-            return phase, "Off / Recovery", planned, "Off"
+        if dow == 5:
+            return phase, "Long Incline / Hike", incline_desc(True), "LongZ2"
+        planned = "Off / Recovery\n\nCoaching Tip: Lean into rest if ME days bury you."
+        return phase, "Off / Recovery", planned, "Off"
 
-    # Phase 2C – Aerobic Power Transition
+    # Phase 2C – Transition
     if start_2c <= dt <= end_2c:
         phase = "Phase 2C – Aerobic Power / Transition"
         if dow == 0:
             planned = (
                 "Strength A – Upper\n\n"
-                "• Bench, Pull-Ups, Incline, Row, Delts, Triceps.\n\n"
-                "Goal: Keep building upper strength while aerobic work turns slightly sharper.\n"
-                "Coaching Tip: Maintain controlled form and consistent progress; no grinders."
+                "Goal: Keep building upper strength as aerobic work sharpens.\n"
+                "Coaching Tip: No grinders; smooth bar speed."
             )
             return phase, "Strength A – Upper", planned, "StrengthA"
-        elif dow == 1:
+        if dow == 1:
             return phase, "Tempo / Threshold Run", tempo_run_desc(), "Tempo"
-        elif dow == 2:
+        if dow == 2:
             return phase, "Z2 Bike / Incline", flex_z2_desc(), "FlexCardio"
-        elif dow == 3:
+        if dow == 3:
             planned = (
                 "Strength B – Lower\n\n"
-                "• Deadlift/RDL, Split Squat/Lunge, Hip Thrust, Row Variation, Biceps, Core.\n\n"
-                "Goal: Maintain leg strength while run/bike intensity starts to rise.\n"
-                "Coaching Tip: If your legs feel overly cooked, trim sets slightly and keep bar speed snappy."
+                "Goal: Maintain leg strength as intensity rises.\n"
+                "Coaching Tip: Trim sets if legs are cooked."
             )
             return phase, "Strength B – Lower", planned, "StrengthB"
-        elif dow == 4:
+        if dow == 4:
             return phase, "Easy Z2 Cardio", flex_z2_desc(), "FlexCardio"
-        elif dow == 5:
+        if dow == 5:
             return phase, "Long Z2 Endurance", long_z2_desc("Bike/Run combo"), "LongZ2"
-        else:
-            planned = (
-                "Off / Recovery\n\n"
-                "• Rest, mobility, easy walking.\n"
-                "Coaching Tip: Use today to de-stress life outside training too."
-            )
-            return phase, "Off / Recovery", planned, "Off"
+        planned = "Off / Recovery\n\nCoaching Tip: De-stress life today too."
+        return phase, "Off / Recovery", planned, "Off"
 
     # Phase 3A – Triathlon Base
     if start_3a <= dt <= end_3a:
         phase = "Phase 3A – Triathlon Base"
         if dow == 0:
             planned = (
-                "Swim (Technique) + Strength A (Short)\n\n"
-                "• Swim: 20–30 min of easy technique drills and short repeats.\n"
-                "• Strength A: Fewer sets than full day; focus on quality.\n\n"
-                "Goal: Build swim comfort while keeping upper-body strength.\n"
-                "Coaching Tip: Smooth water feel > effort. On strength, leave 3 reps in the tank."
+                "Swim (Technique) + Short Strength A\n\n"
+                "Goal: Build swim comfort while keeping upper strength.\n"
+                "Coaching Tip: Smooth water feel > effort."
             )
             return phase, "Swim + Strength A", planned, "StrengthA"
-        elif dow == 1:
+        if dow == 1:
             return phase, "Z2 Bike", flex_z2_desc(), "FlexCardio"
-        elif dow == 2:
+        if dow == 2:
             return phase, "Z2 Run", flex_z2_desc(), "FlexCardio"
-        elif dow == 3:
+        if dow == 3:
             planned = (
                 "Swim + Strength B (Light)\n\n"
-                "• Swim: Technique / easy aerobic.\n"
-                "• Strength B: Light sets for lower body.\n\n"
-                "Goal: Maintain strength without interfering with growing tri volume.\n"
-                "Coaching Tip: If in doubt, cut sets before you cut swim technique work."
+                "Goal: Maintain strength without blocking tri volume."
             )
             return phase, "Swim + Strength B", planned, "StrengthB"
-        elif dow == 4:
+        if dow == 4:
             return phase, "Tempo Bike / Run", tempo_run_desc(), "Tempo"
-        elif dow == 5:
+        if dow == 5:
             return phase, "Long Z2 Bike / Run", long_z2_desc("Bike/Run"), "LongZ2"
-        else:
-            planned = (
-                "Off / Recovery\n\n"
-                "Coaching Tip: Sleep and fueling matter more now than 'one extra easy session.'"
-            )
-            return phase, "Off / Recovery", planned, "Off"
+        planned = "Off / Recovery\n\nCoaching Tip: Sleep and fueling matter most now."
+        return phase, "Off / Recovery", planned, "Off"
 
-    # Phase 3B – Triathlon Build
+    # Phase 3B – Tri Build
     if start_3b <= dt <= end_3b:
         phase = "Phase 3B – Triathlon Build"
         if dow == 0:
             planned = (
                 "Swim Intervals + Optional Short Strength A\n\n"
-                "• Swim: Intervals at moderate-hard effort with easy rest.\n"
-                "• Optional Strength A: cut volume if you feel cooked.\n\n"
-                "Goal: Raise swim fitness while preserving strength.\n"
-                "Coaching Tip: On a long travel week, skip the strength before skipping the swim."
+                "Coaching Tip: Drop strength first on heavy weeks."
             )
             return phase, "Swim Intervals", planned, "StrengthA"
-        elif dow == 1:
+        if dow == 1:
             planned = (
-                "Bike Tempo — 45–75 minutes\n\n"
-                "• Warm-up: 10 min easy.\n"
-                "• Main: 2–4 × 8–12 min at strong tempo (RPE 7) with 4–5 min easy between.\n"
-                "• Cool-down: 5–10 min easy.\n\n"
-                "Goal: Boost sustained power on the bike.\n"
-                "Coaching Tip: Focus on smooth cadence (85–95 rpm) and stable torso."
+                "Bike Tempo — 45–75 min\n\n"
+                "Goal: Raise sustained power.\n"
+                "Coaching Tip: 85–95 rpm, stable torso."
             )
             return phase, "Bike Tempo", planned, "Tempo"
-        elif dow == 2:
+        if dow == 2:
             planned = (
-                "Run Intervals — 30–45 minutes\n\n"
-                "• Warm-up: 10 min easy.\n"
-                "• Main: 4–6 × 3–4 min near 10K/threshold pace (RPE 7–8) "
-                "with equal or slightly shorter easy jog recovery.\n"
-                "• Cool-down: 5–10 min easy.\n\n"
-                "Goal: Raise running speed and resilience at faster paces.\n"
-                "Coaching Tip: First couple intervals should feel too easy—save the grind for the last one or two."
+                "Run Intervals — 30–45 min\n\n"
+                "Goal: Raise running speed and resilience.\n"
+                "Coaching Tip: First few reps should feel too easy."
             )
             return phase, "Run Intervals", planned, "Tempo"
-        elif dow == 3:
+        if dow == 3:
             planned = (
                 "Swim + Easy Strength B\n\n"
-                "• Swim: Aerobic or light interval work.\n"
-                "• Strength B: Very submaximal, focus on joint health and posture.\n\n"
-                "Goal: Maintain strength without beating up tired legs.\n"
-                "Coaching Tip: If brick/long sessions feel heavy, drop this strength session entirely."
+                "Goal: Maintain strength with minimal leg fatigue."
             )
             return phase, "Swim + Strength B", planned, "StrengthB"
-        elif dow == 4:
-            return phase, "Brick (Bike → Run)", brick_desc(long=False), "TriBrick"
-        elif dow == 5:
-            return phase, "Long Bike / Long Brick", brick_desc(long=True), "TriBrick"
-        else:
-            planned = "Off / Recovery\n\nCoaching Tip: Full rest days are where the adaptation happens."
-            return phase, "Off / Recovery", planned, "Off"
+        if dow == 4:
+            return phase, "Brick (Bike → Run)", brick_desc(False), "TriBrick"
+        if dow == 5:
+            return phase, "Long Bike / Long Brick", brick_desc(True), "TriBrick"
+        planned = "Off / Recovery\n\nCoaching Tip: Rest is where adaptation happens."
+        return phase, "Off / Recovery", planned, "Off"
 
-    # Phase 4 – Peak Prep
+    # Phase 4 – Peak
     if start_4 <= dt <= end_4:
         phase = "Phase 4 – Peak / Specific Prep"
         if dow == 0:
             return phase, "Race-Pace Swim", race_like_desc("Swim"), "TriRaceLike"
-        elif dow == 1:
+        if dow == 1:
             return phase, "Race-Pace Bike", race_like_desc("Bike"), "TriRaceLike"
-        elif dow == 2:
+        if dow == 2:
             return phase, "Race-Pace Run", race_like_desc("Run"), "TriRaceLike"
-        elif dow == 3:
+        if dow == 3:
             planned = (
                 "Easy Swim + Very Light Strength\n\n"
-                "Goal: Keep movement quality high without adding fatigue.\n"
-                "Coaching Tip: Treat strength as mobility with resistance here."
+                "Goal: Movement quality, not fatigue."
             )
             return phase, "Easy Swim + Light Strength", planned, "FlexCardio"
-        elif dow == 4:
-            return phase, "Race Simulation Brick", brick_desc(long=False), "TriBrick"
-        elif dow == 5:
-            return phase, "Long Race-Specific Session", brick_desc(long=True), "TriBrick"
-        else:
-            planned = (
-                "Off / Recovery\n\n"
-                "Coaching Tip: Protect sleep like it's part of the training plan (it is)."
-            )
-            return phase, "Off / Recovery", planned, "Off"
+        if dow == 4:
+            return phase, "Race Simulation Brick", brick_desc(False), "TriBrick"
+        if dow == 5:
+            return phase, "Long Race-Specific Session", brick_desc(True), "TriBrick"
+        planned = "Off / Recovery\n\nCoaching Tip: Protect sleep like it's training."
+        return phase, "Off / Recovery", planned, "Off"
 
     # Taper
     if start_taper <= dt <= race_day:
@@ -441,49 +537,41 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
         if dt == race_day:
             planned = (
                 "RACE DAY – Tahoe Triathlon\n\n"
-                "Goal: Execute, stay calm, and have fun. Trust the work you've done.\n"
-                "Coaching Tip: Control the controllables. Nutrition, pacing, and mindset beat last-minute heroics."
+                "Goal: Execute, stay calm, and have fun.\n"
+                "Coaching Tip: Trust the work; no last-minute heroics."
             )
             return phase, "RACE DAY – Tahoe Triathlon", planned, "TriRaceLike"
 
         if dow in [0, 2]:
-            planned = race_like_desc("Swim/Bike/Run (short)")
-            return phase, "Short Race-Pace Sharpening", planned, "TriRaceLike"
-        elif dow in [1, 3]:
+            return phase, "Short Race-Pace Sharpening", race_like_desc("Swim/Bike/Run"), "TriRaceLike"
+        if dow in [1, 3]:
             planned = (
-                "Easy Z2 Cardio — 30–45 minutes\n\n"
-                "Goal: Keep the engine idling without adding fatigue.\n"
-                "Coaching Tip: You should finish these feeling better than you started."
+                "Easy Z2 Cardio — 30–45 min\n\n"
+                "Goal: Keep the engine idling.\n"
+                "Coaching Tip: You should finish feeling better than you started."
             )
             return phase, "Easy Z2 Cardio", planned, "FlexCardio"
-        elif dow == 4:
-            return phase, "Very Short Brick", brick_desc(long=False), "TriBrick"
-        elif dow == 5:
+        if dow == 4:
+            return phase, "Very Short Brick", brick_desc(False), "TriBrick"
+        if dow == 5:
             planned = (
                 "Optional Easy Session\n\n"
-                "Coaching Tip: If you feel even slightly run down, skip this and rest."
+                "Coaching Tip: If slightly run down, skip and rest."
             )
             return phase, "Optional Easy Session", planned, "FlexCardio"
-        else:
-            planned = (
-                "Off / Pre-Race Rest\n\n"
-                "Coaching Tip: Hydrate, eat normally, and visualize smooth race execution."
-            )
-            return phase, "Off / Pre-Race Rest", planned, "Off"
+        planned = (
+            "Off / Pre-Race Rest\n\n"
+            "Coaching Tip: Hydrate, eat normally, visualize smooth execution."
+        )
+        return phase, "Off / Pre-Race Rest", planned, "Off"
 
-    # Fallback
     return "Unprogrammed", "Manual / Free Day", "No structured plan.", "Manual"
 
 
 def adjust_for_workday(phase: str, day_type: str, planned: str, kind: str, work: bool) -> Tuple[str, str, str, str, bool]:
-    """
-    Moderate adjustment: reshape workouts on work days to be less demanding if they are long/ME/brick.
-    Returns (phase, day_type_adj, planned_adj, kind_adj, adjusted_flag)
-    """
     if not work:
         return phase, day_type, planned, kind, False
 
-    # Don't adjust off/manual
     if kind in ["Off", "Manual"]:
         return phase, day_type, planned, kind, False
 
@@ -492,24 +580,23 @@ def adjust_for_workday(phase: str, day_type: str, planned: str, kind: str, work:
         new_planned = (
             "Travel/work day adjustment:\n\n"
             "• Swap to 25–40 min easy Z1–Z2 cardio (Run/Bike/Incline).\n"
-            "• Keep effort low; goal is circulation and headspace, not fitness PRs.\n\n"
-            "Coaching Tip: On long duty days, the win is just 'did something easy and didn't dig a hole.'"
+            "• Goal is circulation and headspace, not fitness PRs.\n\n"
+            "Coaching Tip: On long duty days, 'did something easy' is a win."
         )
-        new_kind = "FlexCardio"
-        return phase, new_day_type, new_planned, new_kind, True
+        return phase, new_day_type, new_planned, "FlexCardio", True
 
     if kind in ["StrengthA", "StrengthB"]:
         new_day_type = f"{day_type} (Workday – lighter loads)"
-        new_planned = planned + "\n\nWorkday Adjustment: Keep 2–4 reps in reserve and cut one set if you feel drained."
+        new_planned = planned + "\n\nWorkday Adjustment: Keep 2–4 reps in reserve and cut one set if drained."
         return phase, new_day_type, new_planned, kind, True
 
     if kind == "Tempo":
         new_day_type = f"{day_type} (Workday – controlled)"
         new_planned = (
             "Tempo (Workday version)\n\n"
-            "• Option 1: 1–2 short tempo reps (6–8 min) instead of full workout.\n"
-            "• Option 2: Convert to 30–40 min Z2 only if very fatigued.\n\n"
-            "Coaching Tip: Travel and sleep debt make tempo feel harder; it's okay to back off."
+            "• Option 1: 1–2 short tempo reps instead of full workout.\n"
+            "• Option 2: Convert to 30–40 min pure Z2 if very fatigued.\n\n"
+            "Coaching Tip: Travel and sleep debt make tempo feel harder."
         )
         return phase, new_day_type, new_planned, kind, True
 
@@ -526,7 +613,7 @@ def get_strength_exercises(kind: str) -> List[Dict[str, Any]]:
             {"name": "Lateral Raises", "alts": LATERAL_ALTS},
             {"name": "Triceps", "alts": TRICEPS_ALTS},
         ]
-    elif kind == "StrengthB":
+    if kind == "StrengthB":
         return [
             {"name": "Deadlift / RDL", "alts": DEADLIFT_ALTS},
             {"name": "Split Squat / Lunge", "alts": SPLIT_SQUAT_ALTS},
@@ -535,12 +622,9 @@ def get_strength_exercises(kind: str) -> List[Dict[str, Any]]:
             {"name": "Biceps", "alts": BICEPS_ALTS},
             {"name": "Core", "alts": CORE_ALTS},
         ]
-    elif kind == "ME":
-        return [
-            {"name": "ME Step-Ups", "alts": ME_ALTS},
-        ]
-    else:
-        return []
+    if kind == "ME":
+        return [{"name": "ME Step-Ups", "alts": ME_ALTS}]
+    return []
 
 
 # ------------------------
@@ -565,25 +649,13 @@ def save_log_row(row: dict) -> None:
     df_out.to_csv(LOG_FILE, index=False)
 
 
-def get_last_strength_entry(
-    df: pd.DataFrame,
-    current_date: date,
-    exercise_name: str,
-    variant_name: str,
-):
-    """
-    Look back in the log for the most recent entry of this exercise+variant
-    before current_date.
-
-    Returns dict with {date, exercise, variant, sets, reps, weight, rpe} or None.
-    """
+def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name: str, variant_name: str):
     if df.empty or "strength_block" not in df.columns:
         return None
 
     past = df[df["date"] < current_date]
     if past.empty:
         return None
-
     past = past.dropna(subset=["strength_block"])
     if past.empty:
         return None
@@ -604,23 +676,21 @@ def get_last_strength_entry(
         for e in entries:
             if not isinstance(e, dict):
                 continue
-
             ex_name = e.get("exercise")
             var_name = e.get("variant") or e.get("alt")
-
             if ex_name == exercise_name and var_name == variant_name:
                 result = e.copy()
                 result["date"] = row["date"]
                 return result
-
     return None
 
 
 # ------------------------
-# STREAMLIT UI
+# STREAMLIT APP
 # ------------------------
 
 st.set_page_config(page_title="2025–26 Training Log", layout="centered")
+init_chat_state()
 
 page = st.sidebar.radio("Page", ["Today", "Work Schedule", "History"])
 
@@ -632,46 +702,31 @@ if page == "Today":
     today = date.today()
     selected_date = st.date_input("Date", value=today)
 
-    # Base programmed workout for this calendar date
     work_flag = is_workday(selected_date)
     base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(selected_date)
 
-    # Workout mode selector
     st.markdown("### Workout Mode")
     workout_mode = st.selectbox(
         "Use which workout today?",
-        [
-            "Auto (Programmed / Adjusted)",
-            "Choose from This Week",
-            "Manual / Custom",
-            "Rest / Skip",
-        ],
+        ["Auto (Programmed / Adjusted)", "Choose from This Week", "Manual / Custom", "Rest / Skip"],
     )
 
-    # Prepare final values
     effective_phase = base_phase
     effective_day_type = base_day_type
     effective_planned = base_planned
     effective_kind = base_kind
     adjusted = False
-    source_date = selected_date  # date the template came from
+    source_date = selected_date
 
-    # Helper: compute this week’s programmed days (Mon–Sun)
     week_monday = selected_date - timedelta(days=selected_date.weekday())
     week_days = [week_monday + timedelta(days=i) for i in range(7)]
 
     if workout_mode == "Auto (Programmed / Adjusted)":
-        # Workday override for auto-adjust
         override = st.checkbox(
             "Override workday adjustment (use original programmed workout)",
             value=False,
         )
-
         if override:
-            effective_phase = base_phase
-            effective_day_type = base_day_type
-            effective_planned = base_planned
-            effective_kind = base_kind
             adjusted = False
         else:
             effective_phase, effective_day_type, effective_planned, effective_kind, adjusted = adjust_for_workday(
@@ -679,22 +734,11 @@ if page == "Today":
             )
 
     elif workout_mode == "Choose from This Week":
-        # Build list of options for this week
         options = []
         for d in week_days:
             ph, dtp, pln, knd = get_phase_and_day_plan(d)
             label = f"{d.strftime('%a %m-%d')} – {dtp} ({ph})"
-            options.append(
-                {
-                    "date": d,
-                    "label": label,
-                    "phase": ph,
-                    "day_type": dtp,
-                    "planned": pln,
-                    "kind": knd,
-                }
-            )
-
+            options.append({"date": d, "label": label, "phase": ph, "day_type": dtp, "planned": pln, "kind": knd})
         labels = [o["label"] for o in options]
         choice = st.selectbox("Pick a workout from this week:", labels)
         chosen = next(o for o in options if o["label"] == choice)
@@ -704,15 +748,12 @@ if page == "Today":
         effective_planned = chosen["planned"]
         effective_kind = chosen["kind"]
         source_date = chosen["date"]
-        adjusted = False  # deliberate choice, not auto-adjust
+        adjusted = False
 
     elif workout_mode == "Manual / Custom":
         effective_phase = "Manual"
         effective_day_type = "Manual / Custom"
-        effective_planned = (
-            "Manual custom session.\n\n"
-            "Use the Strength / Cardio sections and Notes to describe what you actually did."
-        )
+        effective_planned = "Manual custom session. Use Strength / Cardio sections and Notes to describe what you did."
         effective_kind = "Manual"
         adjusted = False
 
@@ -720,14 +761,12 @@ if page == "Today":
         effective_phase = base_phase if base_phase != "Unprogrammed" else "Rest"
         effective_day_type = "Rest / Skip"
         effective_planned = (
-            "Rest / Skip Day\n\n"
-            "Use this when you intentionally skip training (travel, fatigue, life stuff).\n"
-            "Coaching Tip: One skipped day in a well-run block is noise, not a disaster."
+            "Rest / Skip Day\n\nUse when you intentionally skip training (travel, fatigue, life). "
+            "One skipped day in a well-run block is noise, not disaster."
         )
         effective_kind = "Off"
         adjusted = False
 
-    # Display phase + planned
     st.subheader(effective_phase)
     if workout_mode == "Auto (Programmed / Adjusted)":
         if adjusted:
@@ -735,18 +774,17 @@ if page == "Today":
             st.markdown(f"**Adjusted for Workday:** {effective_day_type}")
         else:
             st.caption(f"Day Type: {effective_day_type}")
+    elif workout_mode == "Choose from This Week":
+        st.caption(f"Using: {effective_day_type} (from {source_date.strftime('%a %m-%d')})")
     else:
-        if workout_mode == "Choose from This Week":
-            st.caption(f"Using: {effective_day_type} (from {source_date.strftime('%a %m-%d')})")
-        else:
-            st.caption(f"Day Type: {effective_day_type}")
+        st.caption(f"Day Type: {effective_day_type}")
 
     st.write(f"**Planned Session Details:**\n\n{effective_planned}")
 
     if work_flag and workout_mode == "Auto (Programmed / Adjusted)":
         st.info("This date is marked as a WORKDAY in your schedule.")
-    elif work_flag and workout_mode != "Auto (Programmed / Adjusted)":
-        st.info("This is a WORKDAY, but you have manually chosen today's workout.")
+    elif work_flag:
+        st.info("This is a WORKDAY, but you've manually chosen today's workout.")
 
     st.markdown("---")
 
@@ -762,7 +800,14 @@ if page == "Today":
         "template_source_date": source_date,
     }
 
-    # Cardio log (only if this workout involves cardio)
+    # Cardio log
+    tcx_data = None
+    cardio_mode = ""
+    cardio_duration = 0
+    cardio_distance = ""
+    cardio_avg_hr = ""
+    cardio_rpe = 0
+
     if effective_kind in ["Tempo", "Hill", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
         st.markdown("### Cardio Log")
         cardio_mode = st.selectbox("Cardio mode", CARDIO_MODES, index=0)
@@ -771,15 +816,100 @@ if page == "Today":
         cardio_avg_hr = st.text_input("Cardio avg HR (bpm)", value="")
         cardio_rpe = st.slider("Cardio RPE (1–10)", 1, 10, 6)
 
-        log_data.update(
-            {
-                "cardio_mode": cardio_mode,
-                "cardio_duration_min": cardio_duration,
-                "cardio_distance": cardio_distance,
-                "cardio_avg_hr": cardio_avg_hr,
-                "cardio_rpe_1_10": cardio_rpe,
-            }
-        )
+        st.markdown("#### Upload TCX to auto-fill (optional)")
+        st.caption("If you upload a TCX file, its data will override manual cardio fields when you save.")
+        tcx_file = st.file_uploader("Upload TCX file", type=["tcx"], key=f"tcx_{selected_date}")
+        if tcx_file is not None:
+            parsed = parse_tcx(tcx_file)
+            if parsed:
+                tcx_data = parsed
+                duration_min = int(parsed["duration_sec"] / 60)
+                distance_mi = round(parsed["distance_m"] / 1609.34, 2) if parsed["distance_m"] > 0 else 0.0
+                st.success("TCX file parsed successfully!")
+                st.info(
+                    f"Auto metrics from TCX:\n"
+                    f"- Duration: {duration_min} min\n"
+                    f"- Distance: {distance_mi} mi\n"
+                    f"- Avg HR: {round(parsed['avg_hr'])}\n"
+                    f"- Max HR: {round(parsed['max_hr'])}\n"
+                    f"- Elevation Gain: {round(parsed['elevation_gain_m'])} m\n"
+                    f"- Avg Cadence: {round(parsed['avg_cadence'])}\n"
+                    f"- Pace: {round(parsed['pace_min_per_km'], 2)} min/km\n"
+                    f"- HR Drift: {round(parsed['hr_drift'] * 100, 1)} %"
+                )
+            else:
+                st.error("Could not parse TCX file. Check the file and try again.")
+
+    st.markdown("---")
+
+    # Strength / ME block
+    df_log = load_log()
+    exercises = get_strength_exercises(effective_kind)
+    strength_entries = []
+
+    if exercises:
+        st.markdown("### Strength / ME Session")
+        for i, ex in enumerate(exercises):
+            st.markdown(f"**{ex['name']}**")
+            variant = st.selectbox("Variant", ex["alts"], key=f"{selected_date}_variant_{i}")
+
+            last = get_last_strength_entry(df_log, selected_date, ex["name"], variant)
+            if last:
+                last_date = last.get("date")
+                st.caption(
+                    f"Last ({variant}) — {last_date}: {last.get('sets','')}×"
+                    f"{last.get('reps','')} @ {last.get('weight','')} (RPE {last.get('rpe','')})"
+                )
+            else:
+                st.caption(f"Last ({variant}) — no previous log for this variant yet.")
+
+            col1, col2, col3, col4 = st.columns(4)
+            sets = col1.text_input("Sets", key=f"{selected_date}_sets_{i}")
+            reps = col2.text_input("Reps", key=f"{selected_date}_reps_{i}")
+            weight = col3.text_input("Weight", key=f"{selected_date}_wt_{i}")
+            rpe = col4.text_input("RPE", key=f"{selected_date}_rpe_{i}")
+
+            strength_entries.append(
+                {"exercise": ex["name"], "variant": variant, "sets": sets, "reps": reps, "weight": weight, "rpe": rpe}
+            )
+        log_data["strength_block"] = str(strength_entries)
+    else:
+        log_data["strength_block"] = ""
+
+    # Finalize cardio fields
+    if effective_kind in ["Tempo", "Hill", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
+        if tcx_data:
+            duration_min = int(tcx_data["duration_sec"] / 60)
+            distance_mi = round(tcx_data["distance_m"] / 1609.34, 2) if tcx_data["distance_m"] > 0 else 0.0
+            log_data.update(
+                {
+                    "cardio_mode": cardio_mode,
+                    "cardio_duration_min": duration_min,
+                    "cardio_distance": distance_mi,
+                    "cardio_avg_hr": round(tcx_data["avg_hr"]),
+                    "cardio_rpe_1_10": cardio_rpe,
+                    "cardio_max_hr": round(tcx_data["max_hr"]),
+                    "cardio_elev_gain_m": round(tcx_data["elevation_gain_m"]),
+                    "cardio_avg_cadence": round(tcx_data["avg_cadence"]),
+                    "cardio_pace_min_per_km": round(tcx_data["pace_min_per_km"], 2),
+                    "cardio_hr_drift": round(tcx_data["hr_drift"], 4),
+                }
+            )
+        else:
+            log_data.update(
+                {
+                    "cardio_mode": cardio_mode,
+                    "cardio_duration_min": cardio_duration,
+                    "cardio_distance": cardio_distance,
+                    "cardio_avg_hr": cardio_avg_hr,
+                    "cardio_rpe_1_10": cardio_rpe,
+                    "cardio_max_hr": "",
+                    "cardio_elev_gain_m": "",
+                    "cardio_avg_cadence": "",
+                    "cardio_pace_min_per_km": "",
+                    "cardio_hr_drift": "",
+                }
+            )
     else:
         log_data.update(
             {
@@ -788,66 +918,13 @@ if page == "Today":
                 "cardio_distance": "",
                 "cardio_avg_hr": "",
                 "cardio_rpe_1_10": 0,
+                "cardio_max_hr": "",
+                "cardio_elev_gain_m": "",
+                "cardio_avg_cadence": "",
+                "cardio_pace_min_per_km": "",
+                "cardio_hr_drift": "",
             }
         )
-
-    st.markdown("---")
-
-    # Strength / ME block (only if this workout is a strength/ME type)
-    df_log = load_log()
-    exercises = get_strength_exercises(effective_kind)
-    strength_entries = []
-
-    if exercises:
-        st.markdown("### Strength / ME Session")
-
-        for i, ex in enumerate(exercises):
-            st.markdown(f"**{ex['name']}**")
-
-            # 1) Variant selector first
-            variant = st.selectbox(
-                "Variant",
-                ex["alts"],
-                key=f"{selected_date}_variant_{i}",
-            )
-
-            # 2) Variant-specific last attempt
-            last = get_last_strength_entry(df_log, selected_date, ex["name"], variant)
-
-            if last:
-                last_sets = last.get("sets", "")
-                last_reps = last.get("reps", "")
-                last_wt = last.get("weight", "")
-                last_rpe = last.get("rpe", "")
-                last_date = last.get("date")
-                st.caption(
-                    f"Last ({variant}) — {last_date}: "
-                    f"{last_sets}×{last_reps} @ {last_wt} (RPE {last_rpe})"
-                )
-            else:
-                st.caption(f"Last ({variant}) — no previous log for this variant yet.")
-
-            # 3) Today's log for this variant
-            col1, col2, col3, col4 = st.columns(4)
-            sets = col1.text_input("Sets", key=f"{selected_date}_sets_{i}")
-            reps = col2.text_input("Reps", key=f"{selected_date}_reps_{i}")
-            weight = col3.text_input("Weight", key=f"{selected_date}_wt_{i}")
-            rpe = col4.text_input("RPE", key=f"{selected_date}_rpe_{i}")
-
-            strength_entries.append(
-                {
-                    "exercise": ex["name"],
-                    "variant": variant,
-                    "sets": sets,
-                    "reps": reps,
-                    "weight": weight,
-                    "rpe": rpe,
-                }
-            )
-
-        log_data["strength_block"] = str(strength_entries)
-    else:
-        log_data["strength_block"] = ""
 
     st.markdown("---")
 
@@ -857,10 +934,9 @@ if page == "Today":
     sleep_hrs = colB.text_input("Sleep hours", value="")
     mood = colC.slider("Mood (1–5)", 1, 5, 3)
 
-    colD, colE, colF = st.columns(3)
+    colD, colE, _ = st.columns(3)
     soreness = colD.slider("Soreness (1–5)", 1, 5, 3)
     energy = colE.slider("Energy (1–5)", 1, 5, 3)
-    # colF reserved
 
     notes = st.text_area("Notes", height=120)
 
@@ -886,15 +962,11 @@ if page == "Today":
 
 elif page == "Work Schedule":
     st.title("Work Schedule")
-
-    st.write("Tap the days you are **working (on tour/duty)**. The plan will auto-adjust those days in Auto mode.")
+    st.write("Tap the days you are **working (on tour/duty)**. Auto mode will adjust those days.")
 
     today = date.today()
-    year = st.number_input("Year", min_value=2025, max_value=2030, value=today.year)
-    month = st.number_input("Month", min_value=1, max_value=12, value=today.month)
-
-    year = int(year)
-    month = int(month)
+    year = int(st.number_input("Year", min_value=2025, max_value=2030, value=today.year))
+    month = int(st.number_input("Month", min_value=1, max_value=12, value=today.month))
 
     df_work = load_work_schedule()
     month_flags: Dict[int, bool] = {}
@@ -912,21 +984,18 @@ elif page == "Work Schedule":
 
     first_weekday, num_days = calendar.monthrange(year, month)
     days_iter = 1
-    for week in range(6):
+    for _ in range(6):
         cols = st.columns(7)
         for wd in range(7):
-            if week == 0 and wd < first_weekday:
+            if _ == 0 and wd < first_weekday:
                 cols[wd].write(" ")
             elif days_iter > num_days:
                 cols[wd].write(" ")
             else:
                 dnum = days_iter
-                label = f"{dnum}"
                 default_val = month_flags[dnum]
                 month_flags[dnum] = cols[wd].checkbox(
-                    label,
-                    value=default_val,
-                    key=f"work_{year}_{month}_{dnum}"
+                    f"{dnum}", value=default_val, key=f"work_{year}_{month}_{dnum}"
                 )
                 days_iter += 1
         if days_iter > num_days:
@@ -973,15 +1042,12 @@ elif page == "History":
         day_df = df[df["date"] == selected_hist_date]
         st.write(day_df.T)
 
-        # ---- Export Analytics File ----
         st.markdown("### Export Analytics File (CSV)")
-
         records: List[Dict[str, Any]] = []
 
         for _, row in df.iterrows():
             rdate = row.get("date")
 
-            # Daily summary row
             records.append(
                 {
                     "record_type": "daily",
@@ -1000,12 +1066,16 @@ elif page == "History":
                 }
             )
 
-            # Cardio row
             cardio_mode = row.get("cardio_mode", "")
             cardio_dur = row.get("cardio_duration_min", 0)
             cardio_dist = row.get("cardio_distance", "")
             cardio_hr = row.get("cardio_avg_hr", "")
             cardio_rpe = row.get("cardio_rpe_1_10", 0)
+            cardio_max_hr = row.get("cardio_max_hr", "")
+            cardio_elev = row.get("cardio_elev_gain_m", "")
+            cardio_cad = row.get("cardio_avg_cadence", "")
+            cardio_pace = row.get("cardio_pace_min_per_km", "")
+            cardio_drift = row.get("cardio_hr_drift", "")
 
             if (
                 (isinstance(cardio_mode, str) and cardio_mode.strip())
@@ -1026,11 +1096,15 @@ elif page == "History":
                         "distance": cardio_dist,
                         "avg_hr": cardio_hr,
                         "cardio_rpe": cardio_rpe,
+                        "max_hr": cardio_max_hr,
+                        "elev_gain_m": cardio_elev,
+                        "avg_cadence": cardio_cad,
+                        "pace_min_per_km": cardio_pace,
+                        "hr_drift": cardio_drift,
                         "notes": row.get("notes"),
                     }
                 )
 
-            # Strength rows (expand block)
             strength_block = row.get("strength_block", "")
             if isinstance(strength_block, str) and strength_block.strip():
                 try:
@@ -1071,3 +1145,165 @@ elif page == "History":
             )
         else:
             st.info("No data available to export yet.")
+
+
+# ------------- FLOATING AI COACH BUBBLE -------------
+
+# Chat input form (functional part)
+with st.form(key="ai_coach_form", clear_on_submit=True):
+    user_prompt = st.text_input(
+        "Ask your AI coach something:",
+        value="",
+        label_visibility="collapsed",
+    )
+    submitted = st.form_submit_button("Send to AI Coach")
+    if submitted and user_prompt.strip():
+        add_ai_message("user", user_prompt.strip())
+        reply = call_ai_coach(user_prompt.strip())
+        add_ai_message("assistant", reply)
+        st.experimental_rerun()
+
+# Build HTML for floating bubble & sliding drawer
+chat_html_messages = ""
+for m in st.session_state.ai_messages:
+    role_class = "ai-msg-user" if m["role"] == "user" else "ai-msg-assistant"
+    chat_html_messages += f"""
+    <div class="ai-msg {role_class}">
+        <div class="ai-msg-role">{m['role'].capitalize()}</div>
+        <div class="ai-msg-content">{m['content']}</div>
+    </div>
+    """
+
+bubble_html = f"""
+<style>
+#ai-coach-bubble {{
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    width: 56px;
+    height: 56px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, #4f46e5, #22c55e);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    z-index: 9999;
+    color: white;
+    font-weight: 700;
+    font-size: 26px;
+}}
+
+#ai-coach-bubble:hover {{
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(0,0,0,0.4);
+}}
+
+#ai-coach-drawer {{
+    position: fixed;
+    bottom: 90px;
+    right: 20px;
+    width: 320px;
+    max-height: 70vh;
+    background: #0b1120;
+    color: #e5e7eb;
+    border-radius: 16px;
+    box-shadow: 0 10px 40px rgba(0,0,0,0.6);
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 9998;
+    border: 1px solid #1f2937;
+}}
+
+#ai-coach-header {{
+    padding: 10px 14px;
+    background: #111827;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 14px;
+    border-bottom: 1px solid #1f2937;
+}}
+#ai-coach-header span {{
+    font-weight: 600;
+}}
+
+#ai-coach-close {{
+    cursor: pointer;
+    font-size: 18px;
+    line-height: 1;
+}}
+
+#ai-coach-body {{
+    padding: 10px;
+    overflow-y: auto;
+    max-height: 55vh;
+    font-size: 13px;
+}}
+
+.ai-msg {{
+    margin-bottom: 8px;
+    padding: 8px;
+    border-radius: 8px;
+}}
+.ai-msg-user {{
+    background: #1e293b;
+}}
+.ai-msg-assistant {{
+    background: #020617;
+    border: 1px solid #1e293b;
+}}
+.ai-msg-role {{
+    font-size: 10px;
+    text-transform: uppercase;
+    opacity: 0.6;
+    margin-bottom: 2px;
+}}
+.ai-msg-content {{
+    white-space: pre-wrap;
+}}
+
+#ai-coach-footer {{
+    padding: 8px 10px;
+    background: #020617;
+    font-size: 11px;
+    color: #9ca3af;
+    border-top: 1px solid #1f2937;
+}}
+</style>
+
+<div id="ai-coach-bubble" onclick="toggleAICoachDrawer()">
+    💬
+</div>
+
+<div id="ai-coach-drawer">
+    <div id="ai-coach-header">
+        <span>AI Coach</span>
+        <div id="ai-coach-close" onclick="toggleAICoachDrawer()">×</div>
+    </div>
+    <div id="ai-coach-body">
+        {chat_html_messages}
+    </div>
+    <div id="ai-coach-footer">
+        Type your question in the input at the very bottom of the page and hit Send.
+    </div>
+</div>
+
+<script>
+function toggleAICoachDrawer() {{
+    var drawer = window.parent.document.getElementById('ai-coach-drawer');
+    if (!drawer) {{
+        drawer = document.getElementById('ai-coach-drawer');
+    }}
+    if (drawer.style.display === 'flex') {{
+        drawer.style.display = 'none';
+    }} else {{
+        drawer.style.display = 'flex';
+    }}
+}}
+</script>
+"""
+
+components.html(bubble_html, height=0, width=0)
