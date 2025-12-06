@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import calendar
 from typing import Tuple, List, Dict, Any
 import ast  # for parsing stored strength history
@@ -118,7 +118,7 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
 
     dow = dt.weekday()  # Mon=0
 
-    # --- Helper function to build rich cardio descriptions ---
+    # --- Helper functions for rich cardio descriptions ---
     def tempo_run_desc():
         return (
             "Tempo Run — 30–35 minutes\n\n"
@@ -191,7 +191,7 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
                 "Long Brick — Bike → Run\n\n"
                 "• Bike: 60–90 min Z2 with short segments at race-like effort.\n"
                 "• Transition: 5–10 min quick change.\n"
-                "• Run: 15–25 min off the bike at easy–moderate pace (Z2–Z3-). \n\n"
+                "• Run: 15–25 min off the bike at easy–moderate pace (Z2–Z3-).\n\n"
                 "Goal: Teach your legs to run well off the bike and practice fueling.\n"
                 "Coaching Tip: First 5 minutes of the run should feel laughably easy—let your legs come to you."
             )
@@ -211,7 +211,8 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
             "• Short intervals at your target race effort with plenty of easy recovery.\n"
             "• Total hard time is small; quality > quantity.\n\n"
             "Goal: Lock in the feel of race pace and movement economy.\n"
-            "Coaching Tip: Ask yourself: 'Could I hold this on race day if conditions were good?' If the answer is no, back it off slightly."
+            "Coaching Tip: Ask yourself: 'Could I hold this on race day if conditions were good?' "
+            "If the answer is no, back it off slightly."
         )
 
     # Phase 2A – Strength + Aerobic Base
@@ -281,7 +282,7 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
         else:
             planned = (
                 "Off / Recovery\n\n"
-                "• Rest, light mobility, optional walk.\n\n"
+                "• Rest, light mobility, optional walk.\n"
                 "Coaching Tip: If ME days are burying you, lean into this rest day."
             )
             return phase, "Off / Recovery", planned, "Off"
@@ -470,12 +471,13 @@ def get_phase_and_day_plan(d: date) -> Tuple[str, str, str, str]:
             )
             return phase, "Off / Pre-Race Rest", planned, "Off"
 
+    # Fallback
     return "Unprogrammed", "Manual / Free Day", "No structured plan.", "Manual"
 
 
 def adjust_for_workday(phase: str, day_type: str, planned: str, kind: str, work: bool) -> Tuple[str, str, str, str, bool]:
     """
-    Moderate adjustment: reshapes workouts on work days to be less demanding if they are long/ME/brick.
+    Moderate adjustment: reshape workouts on work days to be less demanding if they are long/ME/brick.
     Returns (phase, day_type_adj, planned_adj, kind_adj, adjusted_flag)
     """
     if not work:
@@ -563,10 +565,17 @@ def save_log_row(row: dict) -> None:
     df_out.to_csv(LOG_FILE, index=False)
 
 
-def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name: str):
+def get_last_strength_entry(
+    df: pd.DataFrame,
+    current_date: date,
+    exercise_name: str,
+    variant_name: str,
+):
     """
-    Look back in the log for the most recent entry of this exercise before current_date.
-    Returns dict with {date, exercise, alt, sets, reps, weight, rpe} or None.
+    Look back in the log for the most recent entry of this exercise+variant
+    before current_date.
+
+    Returns dict with {date, exercise, variant, sets, reps, weight, rpe} or None.
     """
     if df.empty or "strength_block" not in df.columns:
         return None
@@ -579,7 +588,6 @@ def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name:
     if past.empty:
         return None
 
-    # Sort by date descending
     past = past.sort_values("date", ascending=False)
 
     for _, row in past.iterrows():
@@ -592,8 +600,15 @@ def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name:
             continue
         if not isinstance(entries, list):
             continue
+
         for e in entries:
-            if isinstance(e, dict) and e.get("exercise") == exercise_name:
+            if not isinstance(e, dict):
+                continue
+
+            ex_name = e.get("exercise")
+            var_name = e.get("variant") or e.get("alt")
+
+            if ex_name == exercise_name and var_name == variant_name:
                 result = e.copy()
                 result["date"] = row["date"]
                 return result
@@ -617,38 +632,140 @@ if page == "Today":
     today = date.today()
     selected_date = st.date_input("Date", value=today)
 
+    # Base programmed workout for this calendar date
     work_flag = is_workday(selected_date)
+    base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(selected_date)
 
-    phase, day_type, planned, kind = get_phase_and_day_plan(selected_date)
-    phase, day_type_adj, planned_adj, kind_adj, adjusted = adjust_for_workday(
-        phase, day_type, planned, kind, work_flag
+    # Workout mode selector
+    st.markdown("### Workout Mode")
+    workout_mode = st.selectbox(
+        "Use which workout today?",
+        [
+            "Auto (Programmed / Adjusted)",
+            "Choose from This Week",
+            "Manual / Custom",
+            "Rest / Skip",
+        ],
     )
 
-    st.subheader(phase)
-    if adjusted:
-        st.caption(f"Original: {day_type}")
-        st.markdown(f"**Adjusted for Workday:** {day_type_adj}")
-    else:
-        st.caption(f"Day Type: {day_type_adj}")
-    st.write(f"**Planned Session Details:**\n\n{planned_adj}")
+    # Prepare final values
+    effective_phase = base_phase
+    effective_day_type = base_day_type
+    effective_planned = base_planned
+    effective_kind = base_kind
+    adjusted = False
+    source_date = selected_date  # date the template came from
+    mode_label = workout_mode
 
-    if work_flag:
+    # Helper: compute this week’s programmed days (Mon–Sun)
+    week_monday = selected_date - timedelta(days=selected_date.weekday())
+    week_days = [week_monday + timedelta(days=i) for i in range(7)]
+
+    if workout_mode == "Auto (Programmed / Adjusted)":
+        # Workday override for auto-adjust
+        override = st.checkbox(
+            "Override workday adjustment (use original programmed workout)",
+            value=False,
+        )
+
+        if override:
+            effective_phase = base_phase
+            effective_day_type = base_day_type
+            effective_planned = base_planned
+            effective_kind = base_kind
+            adjusted = False
+        else:
+            effective_phase, effective_day_type, effective_planned, effective_kind, adjusted = adjust_for_workday(
+                base_phase, base_day_type, base_planned, base_kind, work_flag
+            )
+
+    elif workout_mode == "Choose from This Week":
+        # Build list of options for this week
+        options = []
+        for d in week_days:
+            ph, dtp, pln, knd = get_phase_and_day_plan(d)
+            label = f"{d.strftime('%a %m-%d')} – {dtp} ({ph})"
+            options.append(
+                {
+                    "date": d,
+                    "label": label,
+                    "phase": ph,
+                    "day_type": dtp,
+                    "planned": pln,
+                    "kind": knd,
+                }
+            )
+
+        labels = [o["label"] for o in options]
+        choice = st.selectbox("Pick a workout from this week:", labels)
+        chosen = next(o for o in options if o["label"] == choice)
+
+        effective_phase = chosen["phase"]
+        effective_day_type = chosen["day_type"]
+        effective_planned = chosen["planned"]
+        effective_kind = chosen["kind"]
+        source_date = chosen["date"]
+        adjusted = False  # this is deliberate choice, not auto-adjust
+
+    elif workout_mode == "Manual / Custom":
+        effective_phase = "Manual"
+        effective_day_type = "Manual / Custom"
+        effective_planned = (
+            "Manual custom session.\n\n"
+            "Use the Strength / Cardio sections and Notes to describe what you actually did."
+        )
+        effective_kind = "Manual"
+        adjusted = False
+
+    elif workout_mode == "Rest / Skip":
+        effective_phase = base_phase if base_phase != "Unprogrammed" else "Rest"
+        effective_day_type = "Rest / Skip"
+        effective_planned = (
+            "Rest / Skip Day\n\n"
+            "Use this when you intentionally skip training (travel, fatigue, life stuff).\n"
+            "Coaching Tip: One skipped day in a well-run block is noise, not a disaster."
+        )
+        effective_kind = "Off"
+        adjusted = False
+
+    # Display phase + planned
+    st.subheader(effective_phase)
+    if workout_mode == "Auto (Programmed / Adjusted)":
+        if adjusted:
+            st.caption(f"Original: {base_day_type}")
+            st.markdown(f"**Adjusted for Workday:** {effective_day_type}")
+        else:
+            st.caption(f"Day Type: {effective_day_type}")
+    else:
+        # Non-auto mode: show what you chose and where it came from
+        if workout_mode == "Choose from This Week":
+            st.caption(f"Using: {effective_day_type} (from {source_date.strftime('%a %m-%d')})")
+        else:
+            st.caption(f"Day Type: {effective_day_type}")
+
+    st.write(f"**Planned Session Details:**\n\n{effective_planned}")
+
+    if work_flag and workout_mode == "Auto (Programmed / Adjusted)":
         st.info("This date is marked as a WORKDAY in your schedule.")
+    elif work_flag and workout_mode != "Auto (Programmed / Adjusted)":
+        st.info("This is a WORKDAY, but you have manually chosen today's workout.")
 
     st.markdown("---")
 
     log_data: Dict[str, Any] = {
         "date": selected_date,
-        "phase": phase,
-        "day_type": day_type,
-        "day_type_adjusted": day_type_adj,
-        "kind": kind,
-        "kind_adjusted": kind_adj,
+        "phase": effective_phase,
+        "day_type": base_day_type,
+        "day_type_adjusted": effective_day_type,
+        "kind": base_kind,
+        "kind_adjusted": effective_kind,
         "workday": work_flag,
+        "mode": workout_mode,
+        "template_source_date": source_date,
     }
 
-    # Cardio block
-    if kind_adj in ["Tempo", "Hill", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
+    # Cardio log (only if this workout involves cardio)
+    if effective_kind in ["Tempo", "Hill", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
         st.markdown("### Cardio Log")
         cardio_mode = st.selectbox("Cardio mode", CARDIO_MODES, index=0)
         cardio_duration = st.number_input("Cardio duration (min)", min_value=0, max_value=600, value=0)
@@ -678,9 +795,9 @@ if page == "Today":
 
     st.markdown("---")
 
-    # Strength / ME block
+    # Strength / ME block (only if this workout is a strength/ME type)
     df_log = load_log()
-    exercises = get_strength_exercises(kind_adj)
+    exercises = get_strength_exercises(effective_kind)
     strength_entries = []
 
     if exercises:
@@ -689,8 +806,16 @@ if page == "Today":
         for i, ex in enumerate(exercises):
             st.markdown(f"**{ex['name']}**")
 
-            # Show last history
-            last = get_last_strength_entry(df_log, selected_date, ex["name"])
+            # 1) Variant selector first
+            variant = st.selectbox(
+                "Variant",
+                ex["alts"],
+                key=f"{selected_date}_variant_{i}",
+            )
+
+            # 2) Variant-specific last attempt
+            last = get_last_strength_entry(df_log, selected_date, ex["name"], variant)
+
             if last:
                 last_sets = last.get("sets", "")
                 last_reps = last.get("reps", "")
@@ -698,15 +823,13 @@ if page == "Today":
                 last_rpe = last.get("rpe", "")
                 last_date = last.get("date")
                 st.caption(
-                    f"Last: {last_date} — {last_sets}×{last_reps} @ {last_wt} (RPE {last_rpe})"
+                    f"Last ({variant}) — {last_date}: "
+                    f"{last_sets}×{last_reps} @ {last_wt} (RPE {last_rpe})"
                 )
             else:
-                st.caption("Last: — no previous log for this lift yet.")
+                st.caption(f"Last ({variant}) — no previous log for this variant yet.")
 
-            alt_choice = st.selectbox(
-                "Variant", ex["alts"], key=f"{selected_date}_alt_{i}"
-            )
-
+            # 3) Today's log for this variant
             col1, col2, col3, col4 = st.columns(4)
             sets = col1.text_input("Sets", key=f"{selected_date}_sets_{i}")
             reps = col2.text_input("Reps", key=f"{selected_date}_reps_{i}")
@@ -716,7 +839,7 @@ if page == "Today":
             strength_entries.append(
                 {
                     "exercise": ex["name"],
-                    "alt": alt_choice,
+                    "variant": variant,
                     "sets": sets,
                     "reps": reps,
                     "weight": weight,
@@ -766,7 +889,7 @@ if page == "Today":
 elif page == "Work Schedule":
     st.title("Work Schedule")
 
-    st.write("Tap the days you are **working (on tour/duty)**. The plan will auto-adjust those days.")
+    st.write("Tap the days you are **working (on tour/duty)**. The plan will auto-adjust those days in Auto mode.")
 
     today = date.today()
     year = st.number_input("Year", min_value=2025, max_value=2030, value=today.year)
@@ -832,6 +955,7 @@ elif page == "History":
                     "date",
                     "phase",
                     "day_type_adjusted",
+                    "mode",
                     "workday",
                     "cardio_mode",
                     "cardio_duration_min",
