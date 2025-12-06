@@ -902,8 +902,8 @@ elif page == "Work Schedule":
 
     for day in range(1, monthrange + 1):
         d = date(year, month, day)
-        if not df_work.empty:
-            is_w = bool(df_work[df["date"] == d]["is_work"].any()) if "date" in df_work.columns else False
+        if not df_work.empty and "date" in df_work.columns:
+            is_w = bool(df_work[df_work["date"] == d]["is_work"].any())
         else:
             is_w = False
         month_flags[day] = is_w
