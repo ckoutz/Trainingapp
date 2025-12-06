@@ -1161,7 +1161,7 @@ with st.form(key="ai_coach_form", clear_on_submit=True):
         add_ai_message("user", user_prompt.strip())
         reply = call_ai_coach(user_prompt.strip())
         add_ai_message("assistant", reply)
-        st.experimental_rerun()
+        st.rerun()
 
 # Build HTML for floating bubble & sliding drawer
 chat_html_messages = ""
