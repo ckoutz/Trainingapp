@@ -655,7 +655,6 @@ if page == "Today":
     effective_kind = base_kind
     adjusted = False
     source_date = selected_date  # date the template came from
-    mode_label = workout_mode
 
     # Helper: compute this week’s programmed days (Mon–Sun)
     week_monday = selected_date - timedelta(days=selected_date.weekday())
@@ -705,7 +704,7 @@ if page == "Today":
         effective_planned = chosen["planned"]
         effective_kind = chosen["kind"]
         source_date = chosen["date"]
-        adjusted = False  # this is deliberate choice, not auto-adjust
+        adjusted = False  # deliberate choice, not auto-adjust
 
     elif workout_mode == "Manual / Custom":
         effective_phase = "Manual"
@@ -737,7 +736,6 @@ if page == "Today":
         else:
             st.caption(f"Day Type: {effective_day_type}")
     else:
-        # Non-auto mode: show what you chose and where it came from
         if workout_mode == "Choose from This Week":
             st.caption(f"Using: {effective_day_type} (from {source_date.strftime('%a %m-%d')})")
         else:
@@ -905,7 +903,7 @@ elif page == "Work Schedule":
     for day in range(1, monthrange + 1):
         d = date(year, month, day)
         if not df_work.empty:
-            is_w = bool(df_work[df_work["date"] == d]["is_work"].any())
+            is_w = bool(df_work[df["date"] == d]["is_work"].any()) if "date" in df_work.columns else False
         else:
             is_w = False
         month_flags[day] = is_w
@@ -974,3 +972,102 @@ elif page == "History":
         selected_hist_date = st.selectbox("Select date", dates_available)
         day_df = df[df["date"] == selected_hist_date]
         st.write(day_df.T)
+
+        # ---- Export Analytics File ----
+        st.markdown("### Export Analytics File (CSV)")
+
+        records: List[Dict[str, Any]] = []
+
+        for _, row in df.iterrows():
+            rdate = row.get("date")
+
+            # Daily summary row
+            records.append(
+                {
+                    "record_type": "daily",
+                    "date": rdate,
+                    "phase": row.get("phase"),
+                    "day_type": row.get("day_type"),
+                    "day_type_adjusted": row.get("day_type_adjusted"),
+                    "mode": row.get("mode"),
+                    "workday": row.get("workday"),
+                    "hrv": row.get("hrv"),
+                    "sleep_hours": row.get("sleep_hours"),
+                    "mood_1_5": row.get("mood_1_5"),
+                    "soreness_1_5": row.get("soreness_1_5"),
+                    "energy_1_5": row.get("energy_1_5"),
+                    "notes": row.get("notes"),
+                }
+            )
+
+            # Cardio row
+            cardio_mode = row.get("cardio_mode", "")
+            cardio_dur = row.get("cardio_duration_min", 0)
+            cardio_dist = row.get("cardio_distance", "")
+            cardio_hr = row.get("cardio_avg_hr", "")
+            cardio_rpe = row.get("cardio_rpe_1_10", 0)
+
+            if (
+                (isinstance(cardio_mode, str) and cardio_mode.strip())
+                or (isinstance(cardio_dur, (int, float)) and cardio_dur > 0)
+                or (isinstance(cardio_dist, str) and cardio_dist.strip())
+            ):
+                records.append(
+                    {
+                        "record_type": "cardio",
+                        "date": rdate,
+                        "phase": row.get("phase"),
+                        "day_type": row.get("day_type"),
+                        "day_type_adjusted": row.get("day_type_adjusted"),
+                        "mode": row.get("mode"),
+                        "workday": row.get("workday"),
+                        "cardio_mode": cardio_mode,
+                        "duration_min": cardio_dur,
+                        "distance": cardio_dist,
+                        "avg_hr": cardio_hr,
+                        "cardio_rpe": cardio_rpe,
+                        "notes": row.get("notes"),
+                    }
+                )
+
+            # Strength rows (expand block)
+            strength_block = row.get("strength_block", "")
+            if isinstance(strength_block, str) and strength_block.strip():
+                try:
+                    entries = ast.literal_eval(strength_block)
+                except (ValueError, SyntaxError):
+                    entries = []
+                if isinstance(entries, list):
+                    for e in entries:
+                        if not isinstance(e, dict):
+                            continue
+                        records.append(
+                            {
+                                "record_type": "strength",
+                                "date": rdate,
+                                "phase": row.get("phase"),
+                                "day_type": row.get("day_type"),
+                                "day_type_adjusted": row.get("day_type_adjusted"),
+                                "mode": row.get("mode"),
+                                "workday": row.get("workday"),
+                                "exercise": e.get("exercise"),
+                                "variant": e.get("variant") or e.get("alt"),
+                                "sets": e.get("sets"),
+                                "reps": e.get("reps"),
+                                "weight": e.get("weight"),
+                                "rpe": e.get("rpe"),
+                                "notes": row.get("notes"),
+                            }
+                        )
+
+        if records:
+            df_export = pd.DataFrame(records)
+            csv_bytes = df_export.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "Download analytics_export.csv",
+                data=csv_bytes,
+                file_name="analytics_export.csv",
+                mime="text/csv",
+            )
+        else:
+            st.info("No data available to export yet.")
