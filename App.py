@@ -73,15 +73,27 @@ def is_workday(d: date) -> bool:
     return bool(df[df["date"] == d]["is_work"].any())
 
 
-def update_work_schedule_for_month(year: int, month: int, selections: Dict[int, bool]) -> None:
+def toggle_workday(day_date: date) -> None:
+    """Toggle a single day as work/non-work and persist."""
     df = load_work_schedule()
-    if not df.empty:
-        mask_same_month = df["date"].apply(lambda x: x.year == year and x.month == month)
-        df = df[~mask_same_month]
+    if df.empty:
+        current = False
+    else:
+        row = df[df["date"] == day_date]
+        current = bool(row["is_work"].iloc[0]) if not row.empty else False
 
-    new_rows = [{"date": date(year, month, day), "is_work": flag} for day, flag in selections.items()]
-    if new_rows:
-        df = pd.concat([df, pd.DataFrame(new_rows)], ignore_index=True)
+    new_state = not current
+
+    # Remove existing row for this date
+    if not df.empty:
+        df = df[df["date"] != day_date]
+
+    # Re-add if new_state is True
+    if new_state:
+        df = pd.concat(
+            [df, pd.DataFrame([{"date": day_date, "is_work": True}])],
+            ignore_index=True,
+        )
 
     save_work_schedule(df)
 
@@ -471,17 +483,6 @@ def get_log_for_date(d: date) -> Dict[str, Any]:
     return rows.iloc[0].to_dict()
 
 
-def delete_log_for_date(d: date) -> None:
-    df = load_log()
-    if df.empty:
-        return
-    df = df[df["date"] != d]
-    df_out = df.copy()
-    if not df_out.empty:
-        df_out["date"] = pd.to_datetime(df_out["date"])
-    df_out.to_csv(LOG_FILE, index=False)
-
-
 # ------------------------
 # EFFECTIVE PLAN (with overrides)
 # ------------------------
@@ -489,7 +490,7 @@ def get_effective_plan(d: date):
     base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(d)
     entry = get_log_for_date(d)
     if entry.get("use_plan_override"):
-        return (
+        return(
             entry.get("override_phase", base_phase),
             entry.get("override_day_type", base_day_type),
             entry.get("override_planned", base_planned),
@@ -887,12 +888,11 @@ def render_today_page():
     work_flag = is_workday(selected)
 
     existing_mode = existing.get("mode", "Auto (Programmed/Adjusted)")
+    mode_options = ["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"]
     mode = st.radio(
         "Workout Mode",
-        ["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"],
-        index=["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"].index(existing_mode)
-        if existing_mode in ["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"]
-        else 0,
+        mode_options,
+        index=mode_options.index(existing_mode) if existing_mode in mode_options else 0,
         horizontal=True,
     )
 
@@ -933,9 +933,9 @@ def render_today_page():
     with st.expander("🧠 Coaching Tips", expanded=False):
         st.write(coaching_tips_for_kind(kind))
 
-    # Cardio
+    # 1) MAIN CARDIO
     st.markdown("---")
-    st.markdown("### Cardio")
+    st.markdown("### Main Cardio")
 
     cardio_kinds = ["Tempo", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]
     is_plan_cardio_day = kind in cardio_kinds
@@ -952,33 +952,15 @@ def render_today_page():
             "avg_hr": existing.get("cardio_main_avg_hr", ""),
             "rpe": existing.get("cardio_main_rpe_1_10", 6),
         }
-        st.markdown("#### Main Cardio (from plan)")
         cardio_main, tcx_main = render_cardio_block("Main", selected, existing_main, allow_tcx=True)
     else:
         st.caption("No specific cardio prescribed today, but you can still log optional work.")
         cardio_main = {}
         tcx_main = None
 
-    add_extra_cardio = st.checkbox(
-        "Add an extra cardio session today?",
-        value=bool(existing.get("cardio_extra_mode", "")),
-    )
-
-    if add_extra_cardio:
-        existing_extra = {
-            "mode": existing.get("cardio_extra_mode", ""),
-            "duration": existing.get("cardio_extra_duration_min", 0),
-            "distance": existing.get("cardio_extra_distance", ""),
-            "avg_hr": existing.get("cardio_extra_avg_hr", ""),
-            "rpe": existing.get("cardio_extra_rpe_1_10", 6),
-        }
-        cardio_extra, _ = render_cardio_block("Extra", selected, existing_extra, allow_tcx=False)
-    else:
-        cardio_extra = {}
-
-    # Strength
+    # 2) MAIN STRENGTH
     st.markdown("---")
-    st.markdown("### Strength / ME")
+    st.markdown("### Main Strength / ME")
 
     strength_main_block = ""
     strength_extra_block = ""
@@ -991,6 +973,28 @@ def render_today_page():
             selected,
             existing.get("strength_main", ""),
         )
+    else:
+        st.caption("No primary strength session prescribed today, but you can still log optional lifting.")
+
+    # 3) OPTIONAL EXTRAS
+    st.markdown("---")
+    st.markdown("### Optional Extras")
+
+    add_extra_cardio = st.checkbox(
+        "Add an extra cardio session today?",
+        value=bool(existing.get("cardio_extra_mode", "")),
+    )
+    if add_extra_cardio:
+        existing_extra = {
+            "mode": existing.get("cardio_extra_mode", ""),
+            "duration": existing.get("cardio_extra_duration_min", 0),
+            "distance": existing.get("cardio_extra_distance", ""),
+            "avg_hr": existing.get("cardio_extra_avg_hr", ""),
+            "rpe": existing.get("cardio_extra_rpe_1_10", 6),
+        }
+        cardio_extra, _ = render_cardio_block("Extra", selected, existing_extra, allow_tcx=False)
+    else:
+        cardio_extra = {}
 
     add_extra_strength = st.checkbox(
         "Add an extra strength session today?",
@@ -1009,7 +1013,7 @@ def render_today_page():
             existing.get("strength_extra", ""),
         )
 
-    # Trackers
+    # 4) DAILY TRACKERS
     st.markdown("---")
     st.markdown("### Daily Trackers")
     df_existing = existing
@@ -1146,10 +1150,6 @@ def render_today_page():
     else:
         st.info("No data entered yet for this day. Nothing saved.")
 
-    if st.button(f"Delete entire log for {selected}"):
-        delete_log_for_date(selected)
-        st.warning(f"Deleted log for {selected}.")
-
     render_ai_coach_panel()
 
 
@@ -1180,30 +1180,40 @@ def render_week_view():
 
     df_log = load_log()
     day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    cols = st.columns(7)
 
-    for i in range(7):
-        d = week_start + timedelta(days=i)
-        phase, day_type, _, kind = get_effective_plan(d)
-        work_flag = is_workday(d)
+    # 2-row grid: first row Mon–Thu, second row Fri–Sun
+    rows = [
+        list(range(0, 4)),
+        list(range(4, 7)),
+    ]
 
-        day_logs = df_log[df_log["date"] == d] if not df_log.empty else pd.DataFrame()
-        has_log = not day_logs.empty
+    for row_indices in rows:
+        cols = st.columns(len(row_indices))
+        for col_pos, i in enumerate(row_indices):
+            d = week_start + timedelta(days=i)
+            phase, day_type, _, _ = get_phase_and_day_plan(d)  # planned only
+            work_flag = is_workday(d)
+            day_logs = df_log[df_log["date"] == d] if not df_log.empty else pd.DataFrame()
+            has_log = not day_logs.empty
 
-        with cols[i]:
-            st.markdown(f"**{day_labels[i]}**")
-            st.caption(f"{d.month}/{d.day}")
-            st.write(day_type)
-            if work_flag:
-                st.markdown("🧳 Work")
-            if has_log:
-                st.markdown("✅ Logged")
-            else:
-                st.markdown("⭕ Not logged")
-            if st.button("Open", key=f"open_{d}"):
-                st.session_state["selected_date"] = d
-                # Switch to Today page by updating radio via session_state trick
-                st.session_state["page"] = "Today"
+            with cols[col_pos]:
+                st.markdown(f"**{day_labels[i]} {d.month}/{d.day}**")
+                st.caption(phase)
+                st.write(day_type)
+                badges = []
+                if work_flag:
+                    badges.append("🧳 work")
+                if has_log:
+                    badges.append("✅ logged")
+                else:
+                    badges.append("⭕ not logged")
+                if badges:
+                    st.caption(" · ".join(badges))
+
+                if st.button("Open", key=f"open_{d}"):
+                    st.session_state["selected_date"] = d
+                    st.session_state["page"] = "Today"
+                    st.experimental_rerun()
 
     render_ai_coach_panel()
 
@@ -1398,18 +1408,11 @@ def render_history_page():
         height=400,
     )
 
-    st.markdown("### Delete a specific day")
-    unique_dates = sorted(df["date"].unique(), reverse=True)
-    del_date = st.selectbox("Choose a date to delete", unique_dates)
-    if st.button("Delete selected date"):
-        delete_log_for_date(del_date)
-        st.warning(f"Deleted log for {del_date}. Refresh the page to see changes.")
-
     render_ai_coach_panel()
 
 
 # ------------------------
-# WORK SCHEDULE PAGE
+# WORK SCHEDULE PAGE (INTERACTIVE CALENDAR)
 # ------------------------
 def render_work_schedule_page():
     st.title("Work Schedule (Tours / Duty Days)")
@@ -1419,21 +1422,20 @@ def render_work_schedule_page():
     month = int(st.number_input("Month", min_value=1, max_value=12, value=today.month))
 
     df_work = load_work_schedule()
-    month_flags: Dict[int, bool] = {}
     num_days = calendar.monthrange(year, month)[1]
 
-    for day in range(1, num_days + 1):
-        d = date(year, month, day)
-        if not df_work.empty:
-            is_w = bool(df_work[df["date"] == d]["is_work"].any()) if "date" in df_work.columns else False
-        else:
-            is_w = False
-        month_flags[day] = is_w
-
     st.subheader(f"{calendar.month_name[month]} {year}")
+    st.caption("Tap a day to toggle it as a workday. 🟦 = workday, ⬜️ = off. Changes save instantly.")
+
     first_weekday, _ = calendar.monthrange(year, month)
     day_counter = 1
 
+    # Weekday header
+    header_cols = st.columns(7)
+    for i, name in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+        header_cols[i].markdown(f"**{name}**")
+
+    # Calendar rows
     for week in range(6):
         cols = st.columns(7)
         for wd in range(7):
@@ -1443,17 +1445,21 @@ def render_work_schedule_page():
                 cols[wd].write(" ")
             else:
                 dnum = day_counter
-                default = month_flags[dnum]
-                month_flags[dnum] = cols[wd].checkbox(
-                    f"{dnum}", value=default, key=f"work_{year}_{month}_{dnum}"
-                )
+                this_date = date(year, month, dnum)
+                if not df_work.empty:
+                    row = df_work[df_work["date"] == this_date]
+                    is_w = bool(row["is_work"].iloc[0]) if not row.empty else False
+                else:
+                    is_w = False
+
+                label = f"{'🟦' if is_w else '⬜️'} {dnum}"
+                if cols[wd].button(label, key=f"workbtn_{year}_{month}_{dnum}"):
+                    toggle_workday(this_date)
+                    st.experimental_rerun()
+
                 day_counter += 1
         if day_counter > num_days:
             break
-
-    if st.button("Save this month’s work schedule"):
-        update_work_schedule_for_month(year, month, month_flags)
-        st.success("Work schedule saved ✅")
 
     render_ai_coach_panel()
 
@@ -1464,19 +1470,31 @@ def render_work_schedule_page():
 def main():
     init_ai_state()
 
-    # Sidebar navigation (hybrid style)
-    page = st.sidebar.radio(
+    # Track current page in session state (our own key)
+    if "page" not in st.session_state:
+        st.session_state["page"] = "Today"
+
+    pages = ["Today", "Week View", "Phase Overview", "History", "Work Schedule"]
+
+    # Sidebar widget uses a different key so we can still modify st.session_state["page"]
+    choice = st.sidebar.radio(
         "Navigate",
-        ["Phase Overview", "Week View", "Today", "History", "Work Schedule"],
-        key="page",
+        pages,
+        index=pages.index(st.session_state["page"]),
+        key="nav_choice",
     )
 
-    if page == "Phase Overview":
-        render_phase_overview()
+    if choice != st.session_state["page"]:
+        st.session_state["page"] = choice
+
+    page = st.session_state["page"]
+
+    if page == "Today":
+        render_today_page()
     elif page == "Week View":
         render_week_view()
-    elif page == "Today":
-        render_today_page()
+    elif page == "Phase Overview":
+        render_phase_overview()
     elif page == "History":
         render_history_page()
     elif page == "Work Schedule":
