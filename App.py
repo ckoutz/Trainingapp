@@ -27,7 +27,7 @@ WORK_FILE = "work_schedule.csv"
 
 CARDIO_MODES = ["Run", "Bike", "Incline Walk"]
 
-# Strength variant lists
+# Strength variants
 BENCH_ALTS = ["Primary (Barbell Bench)", "Dumbbell Bench", "Floor Press", "Push-Ups", "Machine/Smith Bench"]
 PULLUP_ALTS = ["Primary (Pull-Ups)", "Lat Pulldown", "Assisted Pull-Up", "Inverted Row"]
 INCLINE_PRESS_ALTS = ["Primary (Incline Press)", "DB Incline Press", "Machine Incline", "Pike Push-Ups"]
@@ -49,10 +49,13 @@ ME_ALTS = ["Primary (Step-Ups)", "StairStepper", "Incline Grind (sustained)", "R
 # ------------------------
 def load_work_schedule() -> pd.DataFrame:
     try:
-        df = pd.read_csv(WORK_FILE, parse_dates=["date"])
-        df["date"] = df["date"].dt.date
+        df = pd.read_csv(WORK_FILE)
     except FileNotFoundError:
         df = pd.DataFrame(columns=["date", "is_work"])
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df["date"] = df["date"].dt.date
     return df
 
 
@@ -87,9 +90,7 @@ def update_work_schedule_for_month(year: int, month: int, selections: Dict[int, 
 # TCX PARSER
 # ------------------------
 def parse_tcx(file_obj):
-    """
-    Parse TCX and return dict of metrics, or None if parse fails.
-    """
+    """Parse TCX and return dict of metrics, or None if parse fails."""
     try:
         tree = ET.parse(file_obj)
         root = tree.getroot()
@@ -179,12 +180,12 @@ def parse_tcx(file_obj):
 # ------------------------
 def get_phase_and_day_plan(d: date):
     """
-    Return (phase, day_type, planned_description, kind)
-    kind drives widgets: StrengthA, StrengthB, Tempo, FlexCardio, LongZ2, Incline, ME, TriBrick, TriRaceLike, Off, Manual
+    Base deterministic plan.
+    Returns (phase, day_type, planned_description, kind).
     """
     dt = d
 
-    # Macro dates 2025–26
+    # Macro dates
     start_2a = date(2025, 12, 8)
     end_2a   = date(2026, 1, 19)
 
@@ -278,23 +279,13 @@ def get_phase_and_day_plan(d: date):
     if start_2a <= dt <= end_2a:
         phase = "Phase 2A – Strength + Aerobic Base"
         if dow == 0:
-            return (
-                phase,
-                "Strength A – Upper Focus",
-                "Bench, Pull-Ups, Incline Press, Row, Laterals, Triceps.\nLeave 1–3 reps in reserve.",
-                "StrengthA",
-            )
+            return phase, "Strength A – Upper Focus", "Bench, Pull-Ups, Incline Press, Row, Laterals, Triceps.", "StrengthA"
         if dow == 1:
             return phase, "Tempo Run", tempo_desc(), "Tempo"
         if dow == 2:
             return phase, "Z2 Hill Hike", hill_desc(), "Incline"
         if dow == 3:
-            return (
-                phase,
-                "Strength B – Lower/Hypertrophy",
-                "Deadlift/RDL, Split Squat/Lunge, Hip Thrust, Row Var, Biceps, Core.",
-                "StrengthB",
-            )
+            return phase, "Strength B – Lower/Hypertrophy", "Deadlift/RDL, Split Squat/Lunge, Hip Thrust, Row Var, Biceps, Core.", "StrengthB"
         if dow == 4:
             return phase, "Aerobic Flex", flex_z2_desc(), "FlexCardio"
         if dow == 5:
@@ -307,26 +298,16 @@ def get_phase_and_day_plan(d: date):
         if dow == 0:
             return phase, "Z2 Incline", incline_desc(False), "Incline"
         if dow == 1:
-            return (
-                phase,
-                "Strength A – Upper (De-emphasized)",
-                "Keep loads submax; upper maintenance.",
-                "StrengthA",
-            )
+            return phase, "Strength A – Upper (De-emphasized)", "Keep loads submax; upper maintenance.", "StrengthA"
         if dow == 2:
             return phase, "ME Step-Ups + Easy Cardio", me_desc(), "ME"
         if dow == 3:
             return phase, "Z2 Incline", incline_desc(False), "Incline"
         if dow == 4:
-            return (
-                phase,
-                "Strength B – Lower (Light)",
-                "Movement quality > heavy loading.",
-                "StrengthB",
-            )
+            return phase, "Strength B – Lower (Light)", "Movement quality > heavy loading.", "StrengthB"
         if dow == 5:
             return phase, "Long Incline / Hike", incline_desc(True), "LongZ2"
-        return phase, "Off / Recovery", "Off day. Lean into rest if ME buried you.", "Off"
+        return phase, "Off / Recovery", "Off day.", "Off"
 
     # 2C
     if start_2c <= dt <= end_2c:
@@ -349,12 +330,7 @@ def get_phase_and_day_plan(d: date):
     if start_3a <= dt <= end_3a:
         phase = "Phase 3A – Triathlon Base"
         if dow == 0:
-            return (
-                phase,
-                "Swim + Short Strength A",
-                "Technique swim + short upper strength.",
-                "StrengthA",
-            )
+            return phase, "Swim + Short Strength A", "Technique swim + short upper strength.", "StrengthA"
         if dow == 1:
             return phase, "Z2 Bike", flex_z2_desc(), "FlexCardio"
         if dow == 2:
@@ -405,12 +381,7 @@ def get_phase_and_day_plan(d: date):
     if start_taper <= dt <= race_day:
         phase = "Taper"
         if dt == race_day:
-            return (
-                phase,
-                "RACE DAY – Tahoe Triathlon",
-                "Execute, stay calm, and have fun.",
-                "TriRaceLike",
-            )
+            return phase, "RACE DAY – Tahoe Triathlon", "Execute, stay calm, and have fun.", "TriRaceLike"
 
         dow = dt.weekday()
         if dow in [0, 2]:
@@ -431,7 +402,6 @@ def adjust_for_workday(phase, day_type, planned, kind, work: bool):
     if not work:
         return phase, day_type, planned, kind
 
-    # Don't adjust off/manual days
     if kind in ["Off", "Manual"]:
         return phase, day_type, planned, kind
 
@@ -460,6 +430,77 @@ def adjust_for_workday(phase, day_type, planned, kind, work: bool):
     return phase, day_type, planned, kind
 
 
+# ------------------------
+# LOG LOAD / SAVE (SANITIZED)
+# ------------------------
+def load_log() -> pd.DataFrame:
+    try:
+        df = pd.read_csv(LOG_FILE)
+    except FileNotFoundError:
+        return pd.DataFrame()
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df["date"] = df["date"].dt.date
+    return df
+
+
+def save_log_for_date(d: date, row_data: Dict[str, Any]) -> None:
+    df = load_log()
+    if "date" in df.columns and not df.empty:
+        df = df[df["date"] != d]
+
+    row_out = row_data.copy()
+    row_out["date"] = d
+    df = pd.concat([df, pd.DataFrame([row_out])], ignore_index=True)
+
+    df_out = df.copy()
+    if not df_out.empty:
+        df_out["date"] = pd.to_datetime(df_out["date"])
+    df_out.to_csv(LOG_FILE, index=False)
+
+
+def get_log_for_date(d: date) -> Dict[str, Any]:
+    df = load_log()
+    if df.empty or "date" not in df.columns:
+        return {}
+    rows = df[df["date"] == d]
+    if rows.empty:
+        return {}
+    return rows.iloc[0].to_dict()
+
+
+def delete_log_for_date(d: date) -> None:
+    df = load_log()
+    if df.empty:
+        return
+    df = df[df["date"] != d]
+    df_out = df.copy()
+    if not df_out.empty:
+        df_out["date"] = pd.to_datetime(df_out["date"])
+    df_out.to_csv(LOG_FILE, index=False)
+
+
+# ------------------------
+# EFFECTIVE PLAN (with overrides)
+# ------------------------
+def get_effective_plan(d: date):
+    base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(d)
+    entry = get_log_for_date(d)
+    if entry.get("use_plan_override"):
+        return (
+            entry.get("override_phase", base_phase),
+            entry.get("override_day_type", base_day_type),
+            entry.get("override_planned", base_planned),
+            entry.get("override_kind", base_kind),
+        )
+    return base_phase, base_day_type, base_planned, base_kind
+
+
+# ------------------------
+# STRENGTH HELPERS
+# ------------------------
 def get_strength_exercises(kind: str) -> List[Dict[str, Any]]:
     if kind == "StrengthA":
         return [
@@ -482,61 +523,6 @@ def get_strength_exercises(kind: str) -> List[Dict[str, Any]]:
     if kind == "ME":
         return [{"name": "ME Step-Ups", "alts": ME_ALTS}]
     return []
-
-
-# ------------------------
-# LOG LOAD / SAVE
-# ------------------------
-def load_log() -> pd.DataFrame:
-    try:
-        df = pd.read_csv(LOG_FILE, parse_dates=["date"])
-        df["date"] = df["date"].dt.date
-    except FileNotFoundError:
-        df = pd.DataFrame()
-    return df
-
-
-def get_log_for_date(d: date) -> Dict[str, Any]:
-    df = load_log()
-    if df.empty or "date" not in df.columns:
-        return {}
-    rows = df[df["date"] == d]
-    if rows.empty:
-        return {}
-    row = rows.iloc[0].to_dict()
-    return row
-
-
-def save_log_for_date(d: date, row_data: Dict[str, Any]) -> None:
-    """
-    Upsert a single row for a given date.
-    """
-    df = load_log()
-    # Ensure date is stored as date object for comparison
-    if "date" in df.columns:
-        df["date"] = df["date"].apply(lambda x: x if isinstance(x, date) else pd.to_datetime(x).date())
-        df = df[df["date"] != d]
-
-    row_data_out = row_data.copy()
-    row_data_out["date"] = d
-    df = pd.concat([df, pd.DataFrame([row_data_out])], ignore_index=True)
-
-    df_out = df.copy()
-    if not df_out.empty:
-        df_out["date"] = pd.to_datetime(df_out["date"])
-    df_out.to_csv(LOG_FILE, index=False)
-
-
-def delete_log_for_date(d: date) -> None:
-    df = load_log()
-    if df.empty:
-        return
-    df["date"] = df["date"].apply(lambda x: x if isinstance(x, date) else pd.to_datetime(x).date())
-    df = df[df["date"] != d]
-    df_out = df.copy()
-    if not df_out.empty:
-        df_out["date"] = pd.to_datetime(df_out["date"])
-    df_out.to_csv(LOG_FILE, index=False)
 
 
 def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name: str, variant_name: str):
@@ -597,15 +583,18 @@ def build_context_summary(selected_date: date) -> str:
     parts = []
 
     # Today's plan
-    phase, day_type, planned, kind = get_phase_and_day_plan(selected_date)
+    phase, day_type, planned, kind = get_effective_plan(selected_date)
     work_flag = is_workday(selected_date)
-    parts.append(f"Today ({selected_date}): phase={phase}, day_type={day_type}, kind={kind}, workday={work_flag}.")
+    parts.append(
+        f"Today ({selected_date}): phase={phase}, day_type={day_type}, kind={kind}, workday={work_flag}. "
+        f"Planned: {planned}"
+    )
 
     # Upcoming 7 days
     upcoming_lines = []
     for i in range(1, 8):
         d = selected_date + timedelta(days=i)
-        ph, dtp, _, knd = get_phase_and_day_plan(d)
+        ph, dtp, _, knd = get_effective_plan(d)
         upcoming_lines.append(f"{d}: {dtp} ({ph}, kind={knd})")
     parts.append("Next 7 days programmed: " + " | ".join(upcoming_lines))
 
@@ -620,36 +609,12 @@ def build_context_summary(selected_date: date) -> str:
             mode = row.get("mode", "")
             work = row.get("workday", False)
             cmode_main = row.get("cardio_main_mode", "")
-            cmode_extra = row.get("cardio_extra_mode", "")
             dur_main = row.get("cardio_main_duration_min", 0)
-            dur_extra = row.get("cardio_extra_duration_min", 0)
             daily_lines.append(
-                f"{d}: {dt_adj}, mode={mode}, workday={work}, "
-                f"main_cardio={cmode_main} {dur_main}min, extra_cardio={cmode_extra} {dur_extra}min"
+                f"{d}: {dt_adj}, mode={mode}, workday={work}, main_cardio={cmode_main} {dur_main}min"
             )
         if daily_lines:
             parts.append("Last 7 logged days: " + " || ".join(daily_lines))
-
-        # Recent strength summary
-        strength_rows = []
-        for _, row in recent.iterrows():
-            for col in ["strength_main", "strength_extra"]:
-                sb = row.get(col, "")
-                if isinstance(sb, str) and sb.strip():
-                    try:
-                        entries = ast.literal_eval(sb)
-                    except Exception:
-                        entries = []
-                    if isinstance(entries, list):
-                        for e in entries:
-                            if not isinstance(e, dict):
-                                continue
-                            strength_rows.append(
-                                f"{row.get('date')}: {e.get('exercise')} [{e.get('variant')}] "
-                                f"{e.get('sets')}x{e.get('reps')} @ {e.get('weight')} RPE {e.get('rpe')}"
-                            )
-        if strength_rows:
-            parts.append("Recent strength sets: " + " || ".join(strength_rows[:12]))
 
     return "\n".join(parts)
 
@@ -663,7 +628,7 @@ def ai_call_coach(user_message: str) -> str:
         return "AI is not configured yet. Check that OPENAI_API_KEY is set in Streamlit secrets."
 
     try:
-        selected_date = st.session_state.get("focus_date", date.today())
+        selected_date = st.session_state.get("selected_date", date.today())
         context_text = build_context_summary(selected_date)
 
         messages = [
@@ -720,7 +685,7 @@ def render_ai_coach_panel():
 
 
 # ------------------------
-# DAILY EDITOR HELPERS
+# COACHING TIPS
 # ------------------------
 def coaching_tips_for_kind(kind: str) -> str:
     if kind == "Tempo":
@@ -737,23 +702,23 @@ def coaching_tips_for_kind(kind: str) -> str:
             "• You should be able to speak in full sentences.\n"
             "• Keep ego out of it: slower is fine if HR stays smoother.\n"
             "• The goal here is volume and capillary work, not speed.\n"
-            "• Nutrition: a bit of carbs + water/electrolytes helps on longer days."
+            "• The last 20 minutes of a long Z2 day do most of the adaptation."
         )
     if kind in ["StrengthA", "StrengthB", "ME"]:
         return (
             "Strength tips:\n"
             "• Leave 1–3 reps in reserve on most sets; no grinders.\n"
-            "• Prioritize consistent technique and controlled eccentrics.\n"
-            "• If legs are smoked from hills/ME, reduce lower body volume.\n"
-            "• Track weight and RPE; progressive overload is long-game."
+            "• Prioritize controlled eccentrics and consistent rest times.\n"
+            "• If legs are smoked from hills/ME, reduce lower-body volume.\n"
+            "• Track weight and RPE so progression is deliberate, not random."
         )
     if kind in ["TriBrick", "TriRaceLike"]:
         return (
             "Tri-specific tips:\n"
             "• For bricks, accept that the first 3–5 minutes of the run feel awkward.\n"
-            "• Focus on smooth cadence instead of pace chasing.\n"
+            "• Focus on cadence and posture instead of pace chasing.\n"
             "• Race-pace work should feel repeatable, not maximal.\n"
-            "• Respect fatigue — better to be 5% undercooked than 1% overcooked on race day."
+            "• Better to be 5% undercooked than 1% overcooked on race day."
         )
     return (
         "General tips:\n"
@@ -763,6 +728,9 @@ def coaching_tips_for_kind(kind: str) -> str:
     )
 
 
+# ------------------------
+# UI HELPERS – STRENGTH & CARDIO BLOCKS
+# ------------------------
 def render_strength_block(label: str, kind: str, d: date, existing_block: Optional[str]) -> str:
     df_log = load_log()
     exercises = get_strength_exercises(kind)
@@ -901,43 +869,42 @@ def render_cardio_block(label: str, d: date, existing: Dict[str, Any], allow_tcx
 
 
 # ------------------------
-# DAILY EDITOR (MODAL-LIKE)
+# TODAY PAGE (DAILY EDITOR)
 # ------------------------
-def render_daily_editor(focus_date: date):
-    st.markdown("---")
-    st.markdown(f"## 🗓 Daily Log – {focus_date}")
+def render_today_page():
+    st.title("Today")
 
-    existing = get_log_for_date(focus_date)
+    # Selected date in session
+    today = date.today()
+    if "selected_date" not in st.session_state:
+        st.session_state["selected_date"] = today
 
-    base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(focus_date)
-    work_flag = is_workday(focus_date)
+    selected = st.date_input("Choose date", value=st.session_state["selected_date"])
+    st.session_state["selected_date"] = selected
+
+    existing = get_log_for_date(selected)
+    base_phase, base_day_type, base_planned, base_kind = get_effective_plan(selected)
+    work_flag = is_workday(selected)
 
     existing_mode = existing.get("mode", "Auto (Programmed/Adjusted)")
-    phase = existing.get("phase", base_phase)
-    # Kind / day_type will be recomputed from mode
-    mode = st.selectbox(
+    mode = st.radio(
         "Workout Mode",
         ["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"],
         index=["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"].index(existing_mode)
         if existing_mode in ["Auto (Programmed/Adjusted)", "Manual / Custom", "Rest / Skip"]
         else 0,
-        key=f"{focus_date}_mode",
+        horizontal=True,
     )
 
     if mode == "Auto (Programmed/Adjusted)":
         override = st.checkbox(
             "Use original programmed workout even if this is a workday",
             value=bool(existing.get("override_original", False)),
-            key=f"{focus_date}_override",
         )
         if override:
-            day_type = base_day_type
-            planned = base_planned
-            kind = base_kind
+            phase, day_type, planned, kind = base_phase, base_day_type, base_planned, base_kind
         else:
-            phase, day_type, planned, kind = adjust_for_workday(
-                base_phase, base_day_type, base_planned, base_kind, work_flag
-            )
+            phase, day_type, planned, kind = adjust_for_workday(base_phase, base_day_type, base_planned, base_kind, work_flag)
     elif mode == "Manual / Custom":
         phase = existing.get("phase", "Manual")
         day_type = existing.get("day_type_adjusted", "Manual / Custom")
@@ -949,28 +916,33 @@ def render_daily_editor(focus_date: date):
         planned = "Rest or intentional skip. One missed day in a good block is noise, not disaster."
         kind = "Off"
 
-    st.subheader(phase)
-    st.caption(f"Day Type: {day_type}")
+    # Header card
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.subheader(phase)
+        st.caption(f"Day Type: {day_type}")
+    with c2:
+        if work_flag:
+            st.markdown("🧳 **Workday**")
+        else:
+            st.markdown("🏠 **Home day**")
 
-    st.write("**Planned Session Details:**")
+    st.markdown("**Planned Session Details:**")
     st.write(planned)
 
     with st.expander("🧠 Coaching Tips", expanded=False):
         st.write(coaching_tips_for_kind(kind))
 
-    if work_flag:
-        st.info("This date is marked as a WORKDAY in your schedule.")
+    # Cardio
+    st.markdown("---")
+    st.markdown("### Cardio")
 
-    # ---------------- Cardio blocks ----------------
-    cardio_main = {}
-    cardio_extra = {}
-
-    # Determine if the plan implies a main cardio block
     cardio_kinds = ["Tempo", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]
     is_plan_cardio_day = kind in cardio_kinds
 
-    st.markdown("---")
-    st.markdown("### Cardio")
+    cardio_main = {}
+    cardio_extra = {}
+    tcx_main = None
 
     if is_plan_cardio_day:
         existing_main = {
@@ -981,15 +953,15 @@ def render_daily_editor(focus_date: date):
             "rpe": existing.get("cardio_main_rpe_1_10", 6),
         }
         st.markdown("#### Main Cardio (from plan)")
-        cardio_main, tcx_main = render_cardio_block("Main", focus_date, existing_main, allow_tcx=True)
+        cardio_main, tcx_main = render_cardio_block("Main", selected, existing_main, allow_tcx=True)
     else:
+        st.caption("No specific cardio prescribed today, but you can still log optional work.")
         cardio_main = {}
         tcx_main = None
 
     add_extra_cardio = st.checkbox(
         "Add an extra cardio session today?",
         value=bool(existing.get("cardio_extra_mode", "")),
-        key=f"{focus_date}_add_extra_cardio",
     )
 
     if add_extra_cardio:
@@ -1000,66 +972,56 @@ def render_daily_editor(focus_date: date):
             "avg_hr": existing.get("cardio_extra_avg_hr", ""),
             "rpe": existing.get("cardio_extra_rpe_1_10", 6),
         }
-        cardio_extra, tcx_extra = render_cardio_block("Extra", focus_date, existing_extra, allow_tcx=False)
+        cardio_extra, _ = render_cardio_block("Extra", selected, existing_extra, allow_tcx=False)
     else:
         cardio_extra = {}
-        tcx_extra = None
 
-    # If TCX present, override main cardio
-    tcx_main_metrics = tcx_main
-
-    # ---------------- Strength blocks ----------------
+    # Strength
     st.markdown("---")
     st.markdown("### Strength / ME")
 
     strength_main_block = ""
     strength_extra_block = ""
 
-    # Main strength only if plan calls for StrengthA/B/ME
     strength_kinds = ["StrengthA", "StrengthB", "ME"]
     if kind in strength_kinds:
         strength_main_block = render_strength_block(
             "Main",
             kind,
-            focus_date,
+            selected,
             existing.get("strength_main", ""),
         )
 
     add_extra_strength = st.checkbox(
         "Add an extra strength session today?",
         value=bool(existing.get("strength_extra", "")),
-        key=f"{focus_date}_add_extra_strength",
     )
     if add_extra_strength:
-        # Allow choice of strength type for extra
         extra_kind = st.selectbox(
             "Extra strength type",
             ["StrengthA", "StrengthB", "ME"],
             index=0,
-            key=f"{focus_date}_extra_kind",
         )
         strength_extra_block = render_strength_block(
             "Extra",
             extra_kind,
-            focus_date,
+            selected,
             existing.get("strength_extra", ""),
         )
-    else:
-        strength_extra_block = ""
 
-    # ---------------- Daily trackers ----------------
+    # Trackers
     st.markdown("---")
     st.markdown("### Daily Trackers")
+    df_existing = existing
 
     cA, cB, cC = st.columns(3)
-    hrv = cA.text_input("HRV", value=str(existing.get("hrv", "")), key=f"{focus_date}_hrv")
-    sleep_hrs = cB.text_input("Sleep hours", value=str(existing.get("sleep_hours", "")), key=f"{focus_date}_sleep")
+    hrv = cA.text_input("HRV", value=str(df_existing.get("hrv", "")))
+    sleep_hrs = cB.text_input("Sleep hours", value=str(df_existing.get("sleep_hours", "")))
     mood = cC.slider(
         "Mood (1–5)",
         1,
         5,
-        int(existing.get("mood_1_5", 3)) if isinstance(existing.get("mood_1_5", 3), (int, float)) else 3,
-        key=f"{focus_date}_mood",
+        int(df_existing.get("mood_1_5", 3)) if isinstance(df_existing.get("mood_1_5", 3), (int, float)) else 3,
     )
 
     cD, cE, _ = st.columns(3)
@@ -1067,26 +1029,22 @@ def render_daily_editor(focus_date: date):
         "Soreness (1–5)",
         1,
         5,
-        int(existing.get("soreness_1_5", 3)) if isinstance(existing.get("soreness_1_5", 3), (int, float)) else 3,
-        key=f"{focus_date}_soreness",
+        int(df_existing.get("soreness_1_5", 3)) if isinstance(df_existing.get("soreness_1_5", 3), (int, float)) else 3,
     )
     energy = cE.slider(
         "Energy (1–5)",
         1,
         5,
-        int(existing.get("energy_1_5", 3)) if isinstance(existing.get("energy_1_5", 3), (int, float)) else 3,
-        key=f"{focus_date}_energy",
+        int(df_existing.get("energy_1_5", 3)) if isinstance(df_existing.get("energy_1_5", 3), (int, float)) else 3,
     )
 
-    # Notes (debounced / soft autosave by just writing each rerun)
     notes = st.text_area(
         "Notes",
-        value=str(existing.get("notes", "")),
+        value=str(df_existing.get("notes", "")),
         height=120,
-        key=f"{focus_date}_notes",
     )
 
-    # ---------------- Assemble row + autosave ----------------
+    # Assemble row + autosave
     row: Dict[str, Any] = {
         "phase": phase,
         "day_type": base_day_type,
@@ -1095,7 +1053,6 @@ def render_daily_editor(focus_date: date):
         "kind_adjusted": kind,
         "workday": work_flag,
         "mode": mode,
-        "override_original": existing.get("override_original", False),
     }
 
     # Strength
@@ -1104,21 +1061,21 @@ def render_daily_editor(focus_date: date):
 
     # Cardio main
     if cardio_main:
-        if tcx_main_metrics:
-            duration_min = int(tcx_main_metrics["duration_sec"] / 60)
-            distance_mi = round(tcx_main_metrics["distance_m"] / 1609.34, 2) if tcx_main_metrics["distance_m"] > 0 else 0.0
+        if tcx_main:
+            duration_min = int(tcx_main["duration_sec"] / 60)
+            distance_mi = round(tcx_main["distance_m"] / 1609.34, 2) if tcx_main["distance_m"] > 0 else 0.0
             row.update(
                 {
                     "cardio_main_mode": cardio_main["mode"],
                     "cardio_main_duration_min": duration_min,
                     "cardio_main_distance": distance_mi,
-                    "cardio_main_avg_hr": int(tcx_main_metrics["avg_hr"]),
+                    "cardio_main_avg_hr": int(tcx_main["avg_hr"]),
                     "cardio_main_rpe_1_10": cardio_main["rpe"],
-                    "cardio_main_max_hr": int(tcx_main_metrics["max_hr"]),
-                    "cardio_main_elev_gain_m": int(tcx_main_metrics["elevation_gain_m"]),
-                    "cardio_main_avg_cadence": int(tcx_main_metrics["avg_cadence"]),
-                    "cardio_main_pace_min_per_km": round(tcx_main_metrics["pace_min_per_km"], 2),
-                    "cardio_main_hr_drift": round(tcx_main_metrics["hr_drift"], 4),
+                    "cardio_main_max_hr": int(tcx_main["max_hr"]),
+                    "cardio_main_elev_gain_m": int(tcx_main["elevation_gain_m"]),
+                    "cardio_main_avg_cadence": int(tcx_main["avg_cadence"]),
+                    "cardio_main_pace_min_per_km": round(tcx_main["pace_min_per_km"], 2),
+                    "cardio_main_hr_drift": round(tcx_main["hr_drift"], 4),
                 }
             )
         else:
@@ -1129,11 +1086,6 @@ def render_daily_editor(focus_date: date):
                     "cardio_main_distance": cardio_main["distance"],
                     "cardio_main_avg_hr": cardio_main["avg_hr"],
                     "cardio_main_rpe_1_10": cardio_main["rpe"],
-                    "cardio_main_max_hr": existing.get("cardio_main_max_hr", ""),
-                    "cardio_main_elev_gain_m": existing.get("cardio_main_elev_gain_m", ""),
-                    "cardio_main_avg_cadence": existing.get("cardio_main_avg_cadence", ""),
-                    "cardio_main_pace_min_per_km": existing.get("cardio_main_pace_min_per_km", ""),
-                    "cardio_main_hr_drift": existing.get("cardio_main_hr_drift", ""),
                 }
             )
     else:
@@ -1144,11 +1096,6 @@ def render_daily_editor(focus_date: date):
                 "cardio_main_distance": "",
                 "cardio_main_avg_hr": "",
                 "cardio_main_rpe_1_10": 0,
-                "cardio_main_max_hr": "",
-                "cardio_main_elev_gain_m": "",
-                "cardio_main_avg_cadence": "",
-                "cardio_main_pace_min_per_km": "",
-                "cardio_main_hr_drift": "",
             }
         )
 
@@ -1186,79 +1133,235 @@ def render_daily_editor(focus_date: date):
         }
     )
 
-    # Decide if we should save: any field non-empty / non-zero
-    has_content = False
-    for k, v in row.items():
-        if k in ["cardio_main_duration_min", "cardio_extra_duration_min"] and isinstance(v, (int, float)) and v > 0:
-            has_content = True
-            break
-        if isinstance(v, str) and v.strip():
-            has_content = True
-            break
+    # Save if anything non-empty
+    has_content = any(
+        (isinstance(v, (int, float)) and v not in [0, 0.0])
+        or (isinstance(v, str) and v.strip())
+        for v in row.values()
+    )
 
     if has_content:
-        save_log_for_date(focus_date, row)
+        save_log_for_date(selected, row)
         st.success("Auto-saved ✅")
     else:
         st.info("No data entered yet for this day. Nothing saved.")
 
-    # Delete option for this day
-    if st.button(f"Delete entire log for {focus_date}", key=f"delete_{focus_date}"):
-        delete_log_for_date(focus_date)
-        st.warning(f"Deleted log for {focus_date}.")
+    if st.button(f"Delete entire log for {selected}"):
+        delete_log_for_date(selected)
+        st.warning(f"Deleted log for {selected}.")
+
+    render_ai_coach_panel()
 
 
 # ------------------------
-# WEEKLY PLANNER
+# WEEK VIEW
 # ------------------------
 def get_week_start(d: date) -> date:
-    # Monday as start of week
-    return d - timedelta(days=d.weekday())
+    return d - timedelta(days=d.weekday())  # Monday
 
 
-def render_weekly_planner():
-    st.title("Plan & Log")
+def render_week_view():
+    st.title("Week View")
 
     today = date.today()
-    default_focus = today
-    if "focus_date" not in st.session_state:
-        st.session_state["focus_date"] = default_focus
+    if "week_start" not in st.session_state:
+        st.session_state["week_start"] = get_week_start(today)
 
-    week_start = get_week_start(st.session_state.get("focus_date", today))
-    week_start_input = st.date_input("Week of (Monday)", value=week_start)
-    week_start = get_week_start(week_start_input)
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c1:
+        if st.button("« Previous week"):
+            st.session_state["week_start"] = st.session_state["week_start"] - timedelta(days=7)
+    with c3:
+        if st.button("Next week »"):
+            st.session_state["week_start"] = st.session_state["week_start"] + timedelta(days=7)
+
+    week_start = st.session_state["week_start"]
+    st.caption(f"Week of {week_start}")
 
     df_log = load_log()
-
-    cols = st.columns(7)
     day_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    cols = st.columns(7)
 
     for i in range(7):
         d = week_start + timedelta(days=i)
-        phase, day_type, _, kind = get_phase_and_day_plan(d)
+        phase, day_type, _, kind = get_effective_plan(d)
         work_flag = is_workday(d)
 
         day_logs = df_log[df_log["date"] == d] if not df_log.empty else pd.DataFrame()
         has_log = not day_logs.empty
 
         with cols[i]:
-            st.markdown(f"**{day_labels[i]} {d.month}/{d.day}**")
-            st.caption(phase)
+            st.markdown(f"**{day_labels[i]}**")
+            st.caption(f"{d.month}/{d.day}")
             st.write(day_type)
-
             if work_flag:
-                st.markdown("🧳 Workday")
-
+                st.markdown("🧳 Work")
             if has_log:
                 st.markdown("✅ Logged")
             else:
                 st.markdown("⭕ Not logged")
-
             if st.button("Open", key=f"open_{d}"):
-                st.session_state["focus_date"] = d
+                st.session_state["selected_date"] = d
+                # Switch to Today page by updating radio via session_state trick
+                st.session_state["page"] = "Today"
 
-    focus_date = st.session_state.get("focus_date", week_start)
-    render_daily_editor(focus_date)
+    render_ai_coach_panel()
+
+
+# ------------------------
+# PHASE OVERVIEW
+# ------------------------
+def render_phase_overview():
+    st.title("Phase Overview")
+
+    # Define phase ranges for display
+    phases = [
+        {
+            "name": "Phase 2A – Strength + Aerobic Base",
+            "start": date(2025, 12, 8),
+            "end": date(2026, 1, 19),
+            "goals": [
+                "Build aerobic base with Z2 and tempo.",
+                "Increase upper/lower strength without excessive fatigue.",
+                "Prepare legs for upcoming ME block.",
+            ],
+            "weekly_pattern": [
+                "Mon – Strength A (Upper)",
+                "Tue – Tempo Run",
+                "Wed – Hill Z2 Hike",
+                "Thu – Strength B (Lower)",
+                "Fri – Flex Z2 Cardio",
+                "Sat – Long Z2",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Phase 2B – Muscular Endurance",
+            "start": date(2026, 1, 20),
+            "end": date(2026, 2, 23),
+            "goals": [
+                "Develop leg durability for hills and ME work.",
+                "Maintain upper strength with reduced volume.",
+                "Handle work/travel while stacking step-up volume.",
+            ],
+            "weekly_pattern": [
+                "Mon – Z2 Incline",
+                "Tue – Strength A (Upper light)",
+                "Wed – ME Step-Ups + Easy Cardio",
+                "Thu – Z2 Incline",
+                "Fri – Strength B (Lower light)",
+                "Sat – Long Incline / Hike",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Phase 2C – Aerobic Power / Transition",
+            "start": date(2026, 2, 24),
+            "end": date(2026, 3, 30),
+            "goals": [
+                "Bridge into more intense work without losing base.",
+                "Keep legs strong but not destroyed for running.",
+                "Dial in sustainable tempo pacing.",
+            ],
+            "weekly_pattern": [
+                "Mon – Strength A (Upper)",
+                "Tue – Tempo / Threshold Run",
+                "Wed – Z2 Bike / Incline",
+                "Thu – Strength B (Lower)",
+                "Fri – Easy Z2 Cardio",
+                "Sat – Long Z2 (Bike/Run combo)",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Phase 3A – Triathlon Base",
+            "start": date(2026, 3, 31),
+            "end": date(2026, 5, 4),
+            "goals": [
+                "Introduce swim–bike–run structure.",
+                "Keep strength while volume increases.",
+                "Build durable, repeatable Z2 tri training.",
+            ],
+            "weekly_pattern": [
+                "Mon – Swim + Short Strength A",
+                "Tue – Z2 Bike",
+                "Wed – Z2 Run",
+                "Thu – Swim + Strength B (Light)",
+                "Fri – Tempo Bike / Run",
+                "Sat – Long Z2 Bike / Run",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Phase 3B – Triathlon Build",
+            "start": date(2026, 5, 5),
+            "end": date(2026, 6, 22),
+            "goals": [
+                "Sharpen triathlon-specific fitness.",
+                "Introduce more intervals and brick work.",
+                "Maintain strength without compromising key sessions.",
+            ],
+            "weekly_pattern": [
+                "Mon – Swim Intervals + Optional Strength A",
+                "Tue – Bike Tempo",
+                "Wed – Run Intervals",
+                "Thu – Swim + Easy Strength B",
+                "Fri – Brick (Bike → Run)",
+                "Sat – Long Brick / Long Bike",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Phase 4 – Peak / Specific",
+            "start": date(2026, 6, 23),
+            "end": date(2026, 8, 10),
+            "goals": [
+                "Dial in race pace for all three legs.",
+                "Practice race-like sessions and fueling.",
+                "Keep fatigue under control while sharpening.",
+            ],
+            "weekly_pattern": [
+                "Mon – Race-Pace Swim",
+                "Tue – Race-Pace Bike",
+                "Wed – Race-Pace Run",
+                "Thu – Easy Swim + Light Strength",
+                "Fri – Race Simulation Brick",
+                "Sat – Long Race-Specific Session",
+                "Sun – Off / Recovery",
+            ],
+        },
+        {
+            "name": "Taper & Race",
+            "start": date(2026, 8, 11),
+            "end": date(2026, 8, 29),
+            "goals": [
+                "Reduce fatigue while keeping sharpness.",
+                "Practice race-day routines and pacing.",
+                "Arrive fresh and mentally ready for Tahoe Triathlon.",
+            ],
+            "weekly_pattern": [
+                "Short race-pace touches",
+                "Plenty of Z2 / easy movement",
+                "No new fitness, just freshness",
+            ],
+        },
+    ]
+
+    today = date.today()
+
+    for ph in phases:
+        is_current = ph["start"] <= today <= ph["end"]
+        with st.expander(
+            f"{'⭐ ' if is_current else ''}{ph['name']}  ({ph['start']} → {ph['end']})",
+            expanded=is_current,
+        ):
+            st.markdown("**Goals for this phase:**")
+            for g in ph["goals"]:
+                st.markdown(f"- {g}")
+            st.markdown("**Typical week structure:**")
+            for w in ph["weekly_pattern"]:
+                st.markdown(f"- {w}")
+
     render_ai_coach_panel()
 
 
@@ -1266,11 +1369,12 @@ def render_weekly_planner():
 # HISTORY PAGE
 # ------------------------
 def render_history_page():
-    st.title("Training History")
+    st.title("History")
 
     df = load_log()
     if df.empty:
         st.info("No logs saved yet.")
+        render_ai_coach_panel()
         return
 
     df = df.sort_values("date", ascending=False)
@@ -1301,116 +1405,7 @@ def render_history_page():
         delete_log_for_date(del_date)
         st.warning(f"Deleted log for {del_date}. Refresh the page to see changes.")
 
-    st.markdown("### Export for analysis")
-    st.caption("Exports a tall CSV with daily, cardio, and strength rows.")
-
-    records: List[Dict[str, Any]] = []
-    for _, row in df.iterrows():
-        rdate = row.get("date")
-        # Daily
-        records.append(
-            {
-                "record_type": "daily",
-                "date": rdate,
-                "phase": row.get("phase"),
-                "day_type": row.get("day_type"),
-                "day_type_adjusted": row.get("day_type_adjusted"),
-                "mode": row.get("mode"),
-                "workday": row.get("workday"),
-                "hrv": row.get("hrv"),
-                "sleep_hours": row.get("sleep_hours"),
-                "mood_1_5": row.get("mood_1_5"),
-                "soreness_1_5": row.get("soreness_1_5"),
-                "energy_1_5": row.get("energy_1_5"),
-                "notes": row.get("notes"),
-            }
-        )
-
-        # Cardio main
-        if row.get("cardio_main_mode", "") or row.get("cardio_main_duration_min", 0):
-            records.append(
-                {
-                    "record_type": "cardio_main",
-                    "date": rdate,
-                    "phase": row.get("phase"),
-                    "day_type": row.get("day_type"),
-                    "day_type_adjusted": row.get("day_type_adjusted"),
-                    "mode": row.get("mode"),
-                    "workday": row.get("workday"),
-                    "cardio_mode": row.get("cardio_main_mode"),
-                    "duration_min": row.get("cardio_main_duration_min"),
-                    "distance": row.get("cardio_main_distance"),
-                    "avg_hr": row.get("cardio_main_avg_hr"),
-                    "cardio_rpe": row.get("cardio_main_rpe_1_10"),
-                    "max_hr": row.get("cardio_main_max_hr"),
-                    "elev_gain_m": row.get("cardio_main_elev_gain_m"),
-                    "avg_cadence": row.get("cardio_main_avg_cadence"),
-                    "pace_min_per_km": row.get("cardio_main_pace_min_per_km"),
-                    "hr_drift": row.get("cardio_main_hr_drift"),
-                    "notes": row.get("notes"),
-                }
-            )
-
-        # Cardio extra
-        if row.get("cardio_extra_mode", "") or row.get("cardio_extra_duration_min", 0):
-            records.append(
-                {
-                    "record_type": "cardio_extra",
-                    "date": rdate,
-                    "phase": row.get("phase"),
-                    "day_type": row.get("day_type"),
-                    "day_type_adjusted": row.get("day_type_adjusted"),
-                    "mode": row.get("mode"),
-                    "workday": row.get("workday"),
-                    "cardio_mode": row.get("cardio_extra_mode"),
-                    "duration_min": row.get("cardio_extra_duration_min"),
-                    "distance": row.get("cardio_extra_distance"),
-                    "avg_hr": row.get("cardio_extra_avg_hr"),
-                    "cardio_rpe": row.get("cardio_extra_rpe_1_10"),
-                    "notes": row.get("notes"),
-                }
-            )
-
-        # Strength (main + extra)
-        for col_name, rtype in [("strength_main", "strength_main"), ("strength_extra", "strength_extra")]:
-            sb = row.get(col_name, "")
-            if isinstance(sb, str) and sb.strip():
-                try:
-                    entries = ast.literal_eval(sb)
-                except Exception:
-                    entries = []
-                if isinstance(entries, list):
-                    for e in entries:
-                        if not isinstance(e, dict):
-                            continue
-                        records.append(
-                            {
-                                "record_type": rtype,
-                                "date": rdate,
-                                "phase": row.get("phase"),
-                                "day_type": row.get("day_type"),
-                                "day_type_adjusted": row.get("day_type_adjusted"),
-                                "mode": row.get("mode"),
-                                "workday": row.get("workday"),
-                                "exercise": e.get("exercise"),
-                                "variant": e.get("variant") or e.get("alt"),
-                                "sets": e.get("sets"),
-                                "reps": e.get("reps"),
-                                "weight": e.get("weight"),
-                                "rpe": e.get("rpe"),
-                                "notes": row.get("notes"),
-                            }
-                        )
-
-    if records:
-        df_export = pd.DataFrame(records)
-        csv_bytes = df_export.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download analytics_export.csv",
-            data=csv_bytes,
-            file_name="analytics_export.csv",
-            mime="text/csv",
-        )
+    render_ai_coach_panel()
 
 
 # ------------------------
@@ -1430,7 +1425,7 @@ def render_work_schedule_page():
     for day in range(1, num_days + 1):
         d = date(year, month, day)
         if not df_work.empty:
-            is_w = bool(df_work[df_work["date"] == d]["is_work"].any())
+            is_w = bool(df_work[df["date"] == d]["is_work"].any()) if "date" in df_work.columns else False
         else:
             is_w = False
         month_flags[day] = is_w
@@ -1460,32 +1455,7 @@ def render_work_schedule_page():
         update_work_schedule_for_month(year, month, month_flags)
         st.success("Work schedule saved ✅")
 
-
-# ------------------------
-# DEBUG PAGE
-# ------------------------
-def render_debug_page():
-    st.title("Debug / Diagnostics")
-
-    st.subheader("Session State")
-    st.json(st.session_state)
-
-    st.subheader("Test OpenAI API")
-    if client is None:
-        st.error("OpenAI client is not initialised. Check OPENAI_API_KEY in secrets.")
-    else:
-        if st.button("Run quick API test"):
-            try:
-                resp = client.chat.completions.create(
-                    model="gpt-4.1-mini",
-                    messages=[{"role": "user", "content": "Say hi in one short sentence."}],
-                    max_tokens=20,
-                )
-                st.success("API call succeeded:")
-                st.write(resp.choices[0].message.content)
-            except Exception as e:
-                st.error("OpenAI API error:")
-                st.error(str(e))
+    render_ai_coach_panel()
 
 
 # ------------------------
@@ -1493,19 +1463,24 @@ def render_debug_page():
 # ------------------------
 def main():
     init_ai_state()
-    page = st.sidebar.radio("Page", ["Plan & Log", "Work Schedule", "History", "Debug"])
 
-    if page == "Plan & Log":
-        render_weekly_planner()
-    elif page == "Work Schedule":
-        render_work_schedule_page()
-        render_ai_coach_panel()
+    # Sidebar navigation (hybrid style)
+    page = st.sidebar.radio(
+        "Navigate",
+        ["Phase Overview", "Week View", "Today", "History", "Work Schedule"],
+        key="page",
+    )
+
+    if page == "Phase Overview":
+        render_phase_overview()
+    elif page == "Week View":
+        render_week_view()
+    elif page == "Today":
+        render_today_page()
     elif page == "History":
         render_history_page()
-        render_ai_coach_panel()
-    else:
-        render_debug_page()
-        render_ai_coach_panel()
+    elif page == "Work Schedule":
+        render_work_schedule_page()
 
 
 if __name__ == "__main__":
