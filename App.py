@@ -543,7 +543,7 @@ def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name:
 
 
 # ------------------------
-# AI COACH (MODE C – CONTEXTUAL)
+# AI COACH (CONTEXTUAL)
 # ------------------------
 
 def init_ai_state():
@@ -795,21 +795,25 @@ if page == "Today":
         cardio_rpe = st.slider("Cardio RPE (1–10)", 1, 10, 6)
 
         st.markdown("#### Optional: Upload TCX to auto-fill")
-        tcx_file = st.file_uploader("Upload TCX file", type=["tcx"])
+        # iOS-friendly uploader: allow all types, then enforce .tcx manually
+        tcx_file = st.file_uploader("Upload TCX file (.tcx)", type=None)
         if tcx_file is not None:
-            parsed = parse_tcx(tcx_file)
-            if parsed:
-                tcx_data = parsed
-                duration_min = int(parsed["duration_sec"] / 60)
-                distance_mi = round(parsed["distance_m"] / 1609.34, 2) if parsed["distance_m"] > 0 else 0.0
-                st.success("TCX parsed.")
-                st.info(
-                    f"Duration: {duration_min} min | Distance: {distance_mi} mi | "
-                    f"Avg HR: {int(parsed['avg_hr'])} | Max HR: {int(parsed['max_hr'])} | "
-                    f"Elev: {int(parsed['elevation_gain_m'])} m | Pace: {parsed['pace_min_per_km']:.2f} min/km"
-                )
+            if not tcx_file.name.lower().endswith(".tcx"):
+                st.error("Please upload a file with the .tcx extension.")
             else:
-                st.error("Could not parse TCX file; logging manual values.")
+                parsed = parse_tcx(tcx_file)
+                if parsed:
+                    tcx_data = parsed
+                    duration_min = int(parsed["duration_sec"] / 60)
+                    distance_mi = round(parsed["distance_m"] / 1609.34, 2) if parsed["distance_m"] > 0 else 0.0
+                    st.success("TCX parsed.")
+                    st.info(
+                        f"Duration: {duration_min} min | Distance: {distance_mi} mi | "
+                        f"Avg HR: {int(parsed['avg_hr'])} | Max HR: {int(parsed['max_hr'])} | "
+                        f"Elev: {int(parsed['elevation_gain_m'])} m | Pace: {parsed['pace_min_per_km']:.2f} min/km"
+                    )
+                else:
+                    st.error("Could not parse TCX file; logging manual values.")
 
     st.markdown("---")
 
