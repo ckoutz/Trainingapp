@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 from datetime import date, datetime, timedelta
@@ -6,12 +7,13 @@ from typing import Dict, Any, List
 import ast
 import xml.etree.ElementTree as ET
 
-# OpenAI client
+# Attempt to create OpenAI client using secret key
 try:
     from openai import OpenAI
     client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 except Exception:
-    client = None  # we'll handle this gracefully later
+    client = None  # We'll handle gracefully in debug / coach
+
 
 # ------------------------
 # CONFIG / FILE PATHS
@@ -22,7 +24,7 @@ WORK_FILE = "work_schedule.csv"
 
 CARDIO_MODES = ["Run", "Bike", "Incline Walk"]
 
-# Variant lists
+# Strength variant lists
 BENCH_ALTS = ["Primary (Barbell Bench)", "Dumbbell Bench", "Floor Press", "Push-Ups", "Machine/Smith Bench"]
 PULLUP_ALTS = ["Primary (Pull-Ups)", "Lat Pulldown", "Assisted Pull-Up", "Inverted Row"]
 INCLINE_PRESS_ALTS = ["Primary (Incline Press)", "DB Incline Press", "Machine Incline", "Pike Push-Ups"]
@@ -37,79 +39,6 @@ BICEPS_ALTS = ["Primary (Biceps Curl)", "DB Curl", "Hammer Curl", "Band Curl"]
 CORE_ALTS = ["Primary (Core)", "Plank", "Side Plank", "Dead Bug"]
 
 ME_ALTS = ["Primary (Step-Ups)", "StairStepper", "Incline Grind (sustained)", "Ruck Walk", "Box Step Ladder"]
-
-
-# ------------------------
-# AI COACH STATE & LOGIC
-# ------------------------
-
-def init_ai_state():
-    if "ai_messages" not in st.session_state:
-        st.session_state.ai_messages = [
-            {
-                "role": "assistant",
-                "content": (
-                    "Hey, I'm your AI coach. Ask me about today's workout, how to "
-                    "adjust for soreness or travel days, or how to interpret your cardio data."
-                ),
-            }
-        ]
-
-
-def ai_add_message(role: str, content: str):
-    st.session_state.ai_messages.append({"role": role, "content": content})
-
-
-def ai_call_coach(user_message: str) -> str:
-    """Call OpenAI and return reply text (or error message)."""
-    if client is None:
-        return "AI is not configured yet. Check that OPENAI_API_KEY is set in Streamlit secrets."
-
-    try:
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a concise, practical training coach. "
-                    "You help the user interpret workouts, adjust plan for soreness/work travel, "
-                    "and prepare for the Tahoe Triathlon (Aug 29, 2026) plus GBRS-style strength. "
-                    "Answer in short paragraphs with concrete suggestions."
-                ),
-            }
-        ]
-        messages.extend(st.session_state.ai_messages)
-        messages.append({"role": "user", "content": user_message})
-
-        resp = client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=messages,
-            max_tokens=400,
-            temperature=0.5,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        return "OpenAI error: {}".format(e)
-
-
-def render_ai_coach_panel():
-    st.markdown("---")
-    with st.expander("🧠 AI Coach", expanded=False):
-        # Show chat history
-        for m in st.session_state.ai_messages:
-            if m["role"] == "user":
-                st.markdown(f"**You:** {m['content']}")
-            else:
-                st.markdown(f"**Coach:** {m['content']}")
-
-        st.markdown("---")
-        user_q = st.text_input("Ask your coach something:", key="ai_input")
-        send = st.button("Send to Coach", key="ai_send")
-
-        if send and user_q.strip():
-            ai_add_message("user", user_q.strip())
-            reply = ai_call_coach(user_q.strip())
-            ai_add_message("assistant", reply)
-            # the panel will re-render this run with the new messages
 
 
 # ------------------------
@@ -298,9 +227,9 @@ def get_phase_and_day_plan(d: date):
 
     def long_z2_desc(mode="Bike/Run/Hike"):
         return (
-            "Long Z2 {} — 75–90 min.\n"
+            f"Long Z2 {mode} — 75–90 min.\n"
             "Stay in comfortable Z2 (RPE 4–6). You should be able to talk."
-        ).format(mode)
+        )
 
     def flex_z2_desc():
         return (
@@ -340,10 +269,10 @@ def get_phase_and_day_plan(d: date):
 
     def race_like_desc(modality):
         return (
-            "Race-Pace {} session.\n"
+            f"Race-Pace {modality} session.\n"
             "Short intervals at target race effort with easy recovery.\n"
             "Goal: lock in feel of race pace without big fatigue."
-        ).format(modality)
+        )
 
     # 2A
     if start_2a <= dt <= end_2a:
@@ -614,6 +543,153 @@ def get_last_strength_entry(df: pd.DataFrame, current_date: date, exercise_name:
 
 
 # ------------------------
+# AI COACH (MODE C – CONTEXTUAL)
+# ------------------------
+
+def init_ai_state():
+    if "ai_messages" not in st.session_state:
+        st.session_state.ai_messages = [
+            {
+                "role": "assistant",
+                "content": (
+                    "Hey, I'm your AI coach. I can see your plan, recent training, "
+                    "and upcoming week. Ask me about adjustments, fatigue, or how to "
+                    "shape today around your goals."
+                ),
+            }
+        ]
+
+
+def build_context_summary(selected_date: date) -> str:
+    """Build a compact text summary of plan + recent logs + upcoming week for the AI."""
+    parts = []
+
+    # Today's plan
+    phase, day_type, planned, kind = get_phase_and_day_plan(selected_date)
+    work_flag = is_workday(selected_date)
+    parts.append(f"Today ({selected_date}): phase={phase}, day_type={day_type}, kind={kind}, workday={work_flag}.")
+
+    # Upcoming 7 days
+    upcoming_lines = []
+    for i in range(1, 8):
+        d = selected_date + timedelta(days=i)
+        ph, dtp, _, knd = get_phase_and_day_plan(d)
+        upcoming_lines.append(f"{d}: {dtp} ({ph}, kind={knd})")
+    parts.append("Next 7 days programmed: " + " | ".join(upcoming_lines))
+
+    # Recent log (last 7 days)
+    df = load_log()
+    if not df.empty:
+        recent = df[(df["date"] <= selected_date)].sort_values("date", ascending=False).head(7)
+        daily_lines = []
+        for _, row in recent.iterrows():
+            d = row.get("date")
+            dt_adj = row.get("day_type_adjusted", "")
+            mode = row.get("mode", "")
+            work = row.get("workday", False)
+            cmode = row.get("cardio_mode", "")
+            dur = row.get("cardio_duration_min", 0)
+            hr = row.get("cardio_avg_hr", "")
+            daily_lines.append(
+                f"{d}: {dt_adj}, mode={mode}, workday={work}, cardio={cmode} {dur}min HR={hr}"
+            )
+        if daily_lines:
+            parts.append("Last 7 logged days: " + " || ".join(daily_lines))
+
+        # Recent strength summary (last ~10 entries flattened)
+        strength_rows = []
+        for _, row in recent.iterrows():
+            sb = row.get("strength_block", "")
+            if isinstance(sb, str) and sb.strip():
+                try:
+                    entries = ast.literal_eval(sb)
+                except Exception:
+                    entries = []
+                if isinstance(entries, list):
+                    for e in entries:
+                        if not isinstance(e, dict):
+                            continue
+                        strength_rows.append(
+                            f"{row.get('date')}: {e.get('exercise')} [{e.get('variant')}] "
+                            f"{e.get('sets')}x{e.get('reps')} @ {e.get('weight')} RPE {e.get('rpe')}"
+                        )
+        if strength_rows:
+            parts.append("Recent strength sets: " + " || ".join(strength_rows[:10]))
+
+    return "\n".join(parts)
+
+
+def ai_add_message(role: str, content: str):
+    st.session_state.ai_messages.append({"role": role, "content": content})
+
+
+def ai_call_coach(user_message: str) -> str:
+    """Call OpenAI with full training context and return reply text (or error)."""
+    if client is None:
+        return "AI is not configured yet. Check that OPENAI_API_KEY is set in Streamlit secrets."
+
+    try:
+        selected_date = st.session_state.get("last_selected_date", date.today())
+        context_text = build_context_summary(selected_date)
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise, practical training coach. "
+                    "You help the user interpret workouts, adjust plan for soreness/work travel, "
+                    "and prepare for the Tahoe Triathlon (Aug 29, 2026) plus GBRS-style strength. "
+                    "Use the provided context about their schedule and recent logs. "
+                    "Give short, concrete suggestions, not essays."
+                ),
+            },
+            {
+                "role": "system",
+                "content": "Training context:\n" + context_text,
+            },
+        ]
+
+        # Chat history
+        for m in st.session_state.ai_messages:
+            messages.append({"role": m["role"], "content": m["content"]})
+
+        # New user message
+        messages.append({"role": "user", "content": user_message})
+
+        resp = client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=messages,
+            max_tokens=400,
+            temperature=0.5,
+        )
+        return resp.choices[0].message.content
+    except Exception as e:
+        return f"OpenAI error: {e}"
+
+
+def render_ai_coach_panel():
+    st.markdown("---")
+    with st.expander("🧠 AI Coach (context-aware)", expanded=False):
+        # Show history
+        for m in st.session_state.ai_messages:
+            if m["role"] == "user":
+                st.markdown(f"**You:** {m['content']}")
+            else:
+                st.markdown(f"**Coach:** {m['content']}")
+
+        st.markdown("---")
+        user_q = st.text_input("Ask your coach something:", key="ai_input")
+        send = st.button("Send to Coach", key="ai_send")
+
+        if send and user_q.strip():
+            ai_add_message("user", user_q.strip())
+            reply = ai_call_coach(user_q.strip())
+            ai_add_message("assistant", reply)
+            # Clear input for next question
+            st.session_state.ai_input = ""
+
+
+# ------------------------
 # STREAMLIT APP
 # ------------------------
 
@@ -629,6 +705,7 @@ if page == "Today":
 
     today = date.today()
     selected_date = st.date_input("Date", value=today)
+    st.session_state["last_selected_date"] = selected_date
 
     base_phase, base_day_type, base_planned, base_kind = get_phase_and_day_plan(selected_date)
     work_flag = is_workday(selected_date)
@@ -665,7 +742,7 @@ if page == "Today":
         kind = "Off"
 
     st.subheader(phase)
-    st.caption("Day Type: {}".format(day_type))
+    st.caption(f"Day Type: {day_type}")
     st.write("**Planned Session Details:**")
     st.write(planned)
 
@@ -712,14 +789,9 @@ if page == "Today":
                 distance_mi = round(parsed["distance_m"] / 1609.34, 2) if parsed["distance_m"] > 0 else 0.0
                 st.success("TCX parsed.")
                 st.info(
-                    "Duration: {} min\nDistance: {} mi\nAvg HR: {}\nMax HR: {}\nElev: {} m\nPace: {:.2f} min/km".format(
-                        duration_min,
-                        distance_mi,
-                        int(parsed["avg_hr"]),
-                        int(parsed["max_hr"]),
-                        int(parsed["elevation_gain_m"]),
-                        parsed["pace_min_per_km"],
-                    )
+                    f"Duration: {duration_min} min | Distance: {distance_mi} mi | "
+                    f"Avg HR: {int(parsed['avg_hr'])} | Max HR: {int(parsed['max_hr'])} | "
+                    f"Elev: {int(parsed['elevation_gain_m'])} m | Pace: {parsed['pace_min_per_km']:.2f} min/km"
                 )
             else:
                 st.error("Could not parse TCX file; logging manual values.")
@@ -734,29 +806,24 @@ if page == "Today":
     if exercises:
         st.markdown("### Strength / ME Session")
         for i, ex in enumerate(exercises):
-            st.markdown("**{}**".format(ex["name"]))
-            variant = st.selectbox("Variant", ex["alts"], key="{}_variant_{}".format(selected_date, i))
+            st.markdown(f"**{ex['name']}**")
+            variant = st.selectbox("Variant", ex["alts"], key=f"{selected_date}_variant_{i}")
 
             last = get_last_strength_entry(df_log, selected_date, ex["name"], variant)
             if last:
                 st.caption(
-                    "Last ({}) on {}: {}×{} @ {} (RPE {})".format(
-                        variant,
-                        last.get("date"),
-                        last.get("sets", ""),
-                        last.get("reps", ""),
-                        last.get("weight", ""),
-                        last.get("rpe", ""),
-                    )
+                    f"Last ({variant}) on {last.get('date')}: "
+                    f"{last.get('sets', '')}×{last.get('reps', '')} @ {last.get('weight', '')} "
+                    f"(RPE {last.get('rpe', '')})"
                 )
             else:
-                st.caption("Last ({}): no previous log yet.".format(variant))
+                st.caption(f"Last ({variant}): no previous log yet.")
 
             c1, c2, c3, c4 = st.columns(4)
-            sets = c1.text_input("Sets", key="{}_sets_{}".format(selected_date, i))
-            reps = c2.text_input("Reps", key="{}_reps_{}".format(selected_date, i))
-            weight = c3.text_input("Weight", key="{}_wt_{}".format(selected_date, i))
-            rpe = c4.text_input("RPE", key="{}_rpe_{}".format(selected_date, i))
+            sets = c1.text_input("Sets", key=f"{selected_date}_sets_{i}")
+            reps = c2.text_input("Reps", key=f"{selected_date}_reps_{i}")
+            weight = c3.text_input("Weight", key=f"{selected_date}_wt_{i}")
+            rpe = c4.text_input("RPE", key=f"{selected_date}_rpe_{i}")
 
             strength_entries.append(
                 {
@@ -875,7 +942,7 @@ elif page == "Work Schedule":
             is_w = False
         month_flags[day] = is_w
 
-    st.subheader("{} {}".format(calendar.month_name[month], year))
+    st.subheader(f"{calendar.month_name[month]} {year}")
     first_weekday, num_days = calendar.monthrange(year, month)
     days_iter = 1
 
@@ -890,9 +957,9 @@ elif page == "Work Schedule":
                 dnum = days_iter
                 default = month_flags[dnum]
                 month_flags[dnum] = cols[wd].checkbox(
-                    "{}".format(dnum),
+                    f"{dnum}",
                     value=default,
-                    key="work_{}_{}_{}".format(year, month, dnum),
+                    key=f"work_{year}_{month}_{dnum}",
                 )
                 days_iter += 1
         if days_iter > num_days:
