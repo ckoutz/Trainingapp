@@ -678,16 +678,18 @@ def render_ai_coach_panel():
                 st.markdown(f"**Coach:** {m['content']}")
 
         st.markdown("---")
-        user_q = st.text_input("Ask your coach something:", key="ai_input")
-        send = st.button("Send to Coach", key="ai_send")
+        # Create a fresh key each render so the box clears automatically
+        msg_key = f"ai_input_{len(st.session_state.ai_messages)}"
+
+        user_q = st.text_input("Ask your coach something:", key=msg_key)
+        send = st.button("Send to Coach")
 
         if send and user_q.strip():
             ai_add_message("user", user_q.strip())
             reply = ai_call_coach(user_q.strip())
             ai_add_message("assistant", reply)
-            # Clear input for next question
-            st.session_state.ai_input = ""
-
+            # No need to modify session_state — input box clears because the key changed
+            st.experimental_rerun()
 
 # ------------------------
 # STREAMLIT APP
