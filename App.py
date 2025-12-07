@@ -214,7 +214,15 @@ def base_week_template(phase: str) -> List[Dict[str, Any]]:
         ]
 
 
+
 def get_plan_for_date(d: date) -> Dict[str, Any]:
+    """Return the planned workout for a given date, including any weekly shuffles.
+
+    If a week has been rearranged in the 'This Week' view, that mapping is stored
+    in st.session_state['week_overrides'] as a dict:
+        { week_monday_str: { day_idx: template_idx, ... } }
+    so we can remap which template entry is used for each weekday.
+    """
     if d < PLAN_START_DATE:
         return dict(
             phase="Pre-Plan",
@@ -232,11 +240,25 @@ def get_plan_for_date(d: date) -> Dict[str, Any]:
 
     phase = phase_for_week(week_idx)
     template = base_week_template(phase)
-    day_plan = template[day_idx].copy()
+
+    # Apply any weekly overrides (shuffled order)
+    try:
+        overrides = st.session_state.get("week_overrides", {})
+    except Exception:
+        overrides = {}
+    week_monday = PLAN_START_DATE + timedelta(weeks=week_idx)
+    week_key = str(week_monday)
+    mapping = overrides.get(week_key, {})
+    template_idx = mapping.get(day_idx, day_idx)
+    template_idx = max(0, min(len(template) - 1, int(template_idx)))
+
+    day_plan = template[template_idx].copy()
     day_plan["phase"] = f"Phase {phase}"
     day_plan["week_index"] = week_idx + 1
     return day_plan
 
+
+def 
 
 def load_work_schedule() -> pd.DataFrame:
     df = load_csv(WORK_CSV, ["date", "is_work"])
@@ -568,25 +590,30 @@ def render_ai_coach(selected_date: date, logs: pd.DataFrame, work_df: pd.DataFra
         st.session_state.coach_messages.append({"role": "assistant", "content": reply})
 
 
+
 def page_today(logs: pd.DataFrame, work_df: pd.DataFrame):
+    """Main daily view.
+
+    - Header shows the current date.
+    - A compact date-picker in the header lets you jump to any day.
+    - No auto-save: you must click the Save button to store changes.
+    """
     selected_date: date = st.session_state.get("selected_date", today_date())
 
     st.title("Today")
-    st.subheader(nice_date_label(selected_date))
 
-    week_monday = selected_date - timedelta(days=selected_date.weekday())
-    week_days = [week_monday + timedelta(days=i) for i in range(7)]
-    labels = [f"{DAYS_LONG[i]} {d.strftime('%m/%d')}" for i, d in enumerate(week_days)]
-    try:
-        idx_cur = week_days.index(selected_date)
-    except ValueError:
-        idx_cur = 0
-
-    sel_idx = st.selectbox("View a day this week:", range(7), format_func=lambda i: labels[i], index=idx_cur)
-    chosen_date = week_days[sel_idx]
-    if chosen_date != selected_date:
-        st.session_state["selected_date"] = chosen_date
-        selected_date = chosen_date
+    header_col1, header_col2 = st.columns([3, 2])
+    with header_col1:
+        st.subheader(nice_date_label(selected_date))
+    with header_col2:
+        new_date = st.date_input(
+            "Go to date",
+            value=selected_date,
+            key="today_date_picker",
+        )
+        if new_date != selected_date:
+            st.session_state["selected_date"] = new_date
+            selected_date = new_date
 
     plan = get_plan_for_date(selected_date)
     log_row = get_log_for_date(selected_date, logs)
@@ -722,7 +749,16 @@ def page_today(logs: pd.DataFrame, work_df: pd.DataFrame):
     render_ai_coach(selected_date, logs, work_df)
 
 
+def 
+
+
 def page_this_week(logs: pd.DataFrame, work_df: pd.DataFrame):
+    """Weekly overview.
+
+    - Shows each day of the current week with the planned session.
+    - No 'Open' buttons; this page is for reading and light editing only.
+    - You can shuffle workouts within a week using up/down arrows.
+    """
     st.title("This Week")
 
     current_date: date = st.session_state.get("selected_date", today_date())
@@ -743,24 +779,77 @@ def page_this_week(logs: pd.DataFrame, work_df: pd.DataFrame):
 
     monday = current_date - timedelta(days=current_date.weekday())
     st.caption(f"Week of {monday.strftime('%Y-%m-%d')}")
+
+    # Determine override mapping for this week
+    try:
+        overrides = st.session_state.get("week_overrides", {})
+    except Exception:
+        overrides = {}
+    week_key = str(monday)
+    mapping = overrides.get(week_key, {})
+
+    def get_template_idx_for_day(day_idx: int, template_len: int) -> int:
+        idx = mapping.get(day_idx, day_idx)
+        return max(0, min(template_len - 1, int(idx)))
+
     st.markdown("---")
+
+    # Figure out which phase this week belongs to (for shuffle support)
+    can_shuffle = monday >= PLAN_START_DATE
+    if can_shuffle:
+        days_from_start = (monday - PLAN_START_DATE).days
+        week_idx = days_from_start // 7
+        phase = phase_for_week(week_idx)
+        template = base_week_template(phase)
+    else:
+        template = base_week_template("2A")  # dummy, won't actually be used
 
     for i in range(7):
         d = monday + timedelta(days=i)
         plan = get_plan_for_date(d)
-        st.markdown(f"#### {DAYS_LONG[i]} {d.strftime('%m/%d')}")
-        st.markdown(f"*{plan.get('phase', '')}*")
-        st.markdown(f"**{plan['name']}**")
-        if plan.get("est_minutes"):
-            st.markdown(f"_Est. time: {plan['est_minutes']} min_")
-        if plan.get("description"):
-            st.write(plan["description"])
-        if st.button("Open", key=f"open_{d}"):
-            st.session_state["selected_date"] = d
+
+        row_cols = st.columns([0.15, 0.85])
+        with row_cols[0]:
+            if can_shuffle:
+                # Up / Down arrows to swap template assignment with neighbours
+                if i > 0 and st.button("↑", key=f"wk_up_{week_key}_{i}"):
+                    prev_idx = get_template_idx_for_day(i - 1, len(template))
+                    cur_idx = get_template_idx_for_day(i, len(template))
+                    mapping[i - 1] = cur_idx
+                    mapping[i] = prev_idx
+                    overrides[week_key] = mapping
+                    st.session_state["week_overrides"] = overrides
+                if i < 6 and st.button("↓", key=f"wk_dn_{week_key}_{i}"):
+                    next_idx = get_template_idx_for_day(i + 1, len(template))
+                    cur_idx = get_template_idx_for_day(i, len(template))
+                    mapping[i + 1] = cur_idx
+                    mapping[i] = next_idx
+                    overrides[week_key] = mapping
+                    st.session_state["week_overrides"] = overrides
+            else:
+                st.write("")
+
+        with row_cols[1]:
+            st.markdown(f"#### {DAYS_LONG[i]} {d.strftime('%m/%d')}")
+            st.markdown(f"*{plan.get('phase', '')}*")
+            st.markdown(f"**{plan['name']}**")
+            if plan.get("est_minutes"):
+                st.markdown(f"_Est. time: {plan['est_minutes']} min_")
+            if plan.get("description"):
+                st.write(plan["description"])
+
         st.markdown("---")
 
 
+def 
+
+
 def render_calendar(year: int, month: int, logs: pd.DataFrame, work_df: pd.DataFrame):
+    """Simple month view.
+
+    - Squares (buttons) are filled red for work days (via a red square emoji).
+    - No other indicators: no dots for logs, no highlight for today.
+    """
     st.subheader(f"{datetime(year, month, 1).strftime('%B %Y')}")
 
     col1, col2, col3 = st.columns(3)
@@ -784,7 +873,7 @@ def render_calendar(year: int, month: int, logs: pd.DataFrame, work_df: pd.DataF
     st.markdown("**S   M   T   W   T   F   S**")
 
     first = date(year, month, 1)
-    first_weekday = (first.weekday() + 1) % 7
+    first_weekday = (first.weekday() + 1) % 7  # Monday=0 -> Sunday=0
     if month == 12:
         days_in_month = (date(year + 1, 1, 1) - timedelta(days=1)).day
     else:
@@ -798,7 +887,6 @@ def render_calendar(year: int, month: int, logs: pd.DataFrame, work_df: pd.DataF
     while len(cells) % 7 != 0:
         cells.append(None)
 
-    today = today_date()
     for i in range(0, len(cells), 7):
         cols = st.columns(7)
         for j, d in enumerate(cells[i:i+7]):
@@ -807,19 +895,17 @@ def render_calendar(year: int, month: int, logs: pd.DataFrame, work_df: pd.DataF
                     st.write(" ")
                 else:
                     label = str(d.day)
-                    if d == today:
-                        label = f"🔵 {label}"
                     if is_workday(d, work_df):
-                        label = f"🔴 {label}"
-                    has_log = get_log_for_date(d, logs) is not None
-                    if has_log and "🔵" not in label and "🔴" not in label:
-                        label = f"• {label}"
+                        # red square indicator for work days
+                        label = f"🟥 {label}"
                     if st.button(label, key=f"cal_{d}"):
                         new_df = toggle_workday(d, work_df)
                         save_work_schedule(new_df)
                         st.session_state["work_df"] = new_df
                         st.session_state["selected_date"] = d
 
+
+def 
 
 def page_calendar(logs: pd.DataFrame, work_df: pd.DataFrame):
     st.title("Calendar (Work + Training)")
@@ -835,16 +921,45 @@ def page_calendar(logs: pd.DataFrame, work_df: pd.DataFrame):
     render_calendar(year, month, logs, work_df)
 
 
+
 def page_phase():
+    """Phase overview with ability to flip between phases."""
     st.title("Phase Overview")
 
+    # Determine the "current" phase based on today's date for reference
     today = today_date()
     days_from_start = (today - PLAN_START_DATE).days
     week_idx = max(0, days_from_start // 7)
-    phase = phase_for_week(week_idx)
+    current_phase = phase_for_week(week_idx)
 
-    st.markdown(f"### Current phase: Phase {phase}")
-    if phase == "2A":
+    phases = ["2A", "2B"]
+    if "phase_view" not in st.session_state:
+        st.session_state["phase_view"] = current_phase
+
+    view_phase = st.session_state["phase_view"]
+    try:
+        cur_i = phases.index(view_phase)
+    except ValueError:
+        cur_i = phases.index(current_phase)
+        view_phase = current_phase
+        st.session_state["phase_view"] = view_phase
+
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col1:
+        if st.button("← Prev phase"):
+            cur_i = (cur_i - 1) % len(phases)
+            view_phase = phases[cur_i]
+            st.session_state["phase_view"] = view_phase
+    with col2:
+        st.markdown(f"### Viewing Phase {view_phase}")
+        st.caption(f"Current actual phase (by date): {current_phase}")
+    with col3:
+        if st.button("Next phase →"):
+            cur_i = (cur_i + 1) % len(phases)
+            view_phase = phases[cur_i]
+            st.session_state["phase_view"] = view_phase
+
+    if view_phase == "2A":
         st.write(
             "Phase 2A = Strength + Aerobic Base. Build upper/lower strength, GBRS support, and aerobic volume "
             "without going too hard yet."
@@ -856,8 +971,15 @@ def page_phase():
         )
 
     st.markdown("### Upcoming weeks (high-level)")
+
+    # Anchor upcoming-week preview to the start of the chosen phase
+    if view_phase == "2A":
+        base_week_idx = 0
+    else:
+        base_week_idx = 8
+
     for offset in range(0, 4):
-        w = week_idx + offset
+        w = base_week_idx + offset
         ph = phase_for_week(w)
         monday = PLAN_START_DATE + timedelta(weeks=w)
         st.markdown(f"**Week {w + 1} ({monday.strftime('%b %d')}) – Phase {ph}**")
@@ -866,18 +988,36 @@ def page_phase():
         st.caption(names)
 
 
-def page_history(logs: pd.DataFrame):
+def 
+
+
+def page_history(logs: pd.DataFrame, work_df: pd.DataFrame):
+    """History view with export, per-day delete, and AI coach review."""
     st.title("History")
 
     if logs.empty:
         st.info("No logs yet.")
         return
 
+    # Export entire history as CSV
+    csv_data = logs.to_csv(index=False)
+    st.download_button(
+        "⬇️ Export full history (CSV)",
+        data=csv_data,
+        file_name="training_history.csv",
+        mime="text/csv",
+    )
+
+    if "history_coach_reviews" not in st.session_state:
+        st.session_state["history_coach_reviews"] = {}
+
     logs_sorted = logs.sort_values("date", ascending=False)
+
     for _, row in logs_sorted.iterrows():
         d = row["date"]
         st.markdown(f"#### {nice_date_label(d)}")
         st.caption(f"Mode: {row.get('mode', '')} | AI used: {'yes' if row.get('used_ai') else 'no'}")
+
         if row.get("cardio_json"):
             try:
                 c = json.loads(row["cardio_json"])
@@ -887,6 +1027,7 @@ def page_history(logs: pd.DataFrame):
                 )
             except Exception:
                 pass
+
         if row.get("strength_json"):
             try:
                 s = json.loads(row["strength_json"])
@@ -896,14 +1037,52 @@ def page_history(logs: pd.DataFrame):
                 )
             except Exception:
                 pass
+
         st.caption(
             f"HRV: {row.get('hrv')} | Sleep: {row.get('sleep_hours')}h | "
             f"Soreness: {row.get('soreness')} | Energy: {row.get('energy')}"
         )
         if row.get("notes"):
             st.write(row["notes"])
+
+        # Row of actions: AI coach review + delete
+        act_col1, act_col2 = st.columns(2)
+        with act_col1:
+            if st.button("🧠 Coach review", key=f"hist_coach_{d}"):
+                plan = get_plan_for_date(d)
+                is_work = is_workday(d, work_df)
+                payload = {
+                    "date": str(d),
+                    "plan": plan,
+                    "log": row.to_dict(),
+                    "is_workday": is_work,
+                }
+                system = (
+                    "You are a concise performance coach. Given the log for this specific day, "
+                    "summarize what went well, what to watch, and how to adjust the next 1–2 days if needed. "
+                    "Keep it under 6 sentences."
+                )
+                user = json.dumps(payload, indent=2)
+                reply = ai_chat(system, user)
+                st.session_state["history_coach_reviews"][str(d)] = reply
+        with act_col2:
+            if st.button("🗑 Delete this day", key=f"hist_del_{d}"):
+                # Instant delete (no confirmation)
+                new_logs = logs[logs["date"] != d]
+                save_logs(new_logs)
+                st.success(f"Deleted log for {nice_date_label(d)}.")
+                # After widget interaction Streamlit reruns, so we can just return
+                return
+
+        # Show any stored coach review
+        review = st.session_state["history_coach_reviews"].get(str(d))
+        if review:
+            st.info(review)
+
         st.markdown("---")
 
+
+def 
 
 def main():
     if "selected_date" not in st.session_state:
@@ -938,7 +1117,7 @@ def main():
     elif page == "Phase":
         page_phase()
     elif page == "History":
-        page_history(logs)
+        page_history(logs, work_df)
 
 
 if __name__ == "__main__":
