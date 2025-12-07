@@ -678,9 +678,8 @@ def render_ai_coach_panel():
                 st.markdown(f"**Coach:** {m['content']}")
 
         st.markdown("---")
-        # Create a fresh key each render so the box clears automatically
+        # Use changing key so box clears after send, no rerun needed
         msg_key = f"ai_input_{len(st.session_state.ai_messages)}"
-
         user_q = st.text_input("Ask your coach something:", key=msg_key)
         send = st.button("Send to Coach")
 
@@ -688,8 +687,8 @@ def render_ai_coach_panel():
             ai_add_message("user", user_q.strip())
             reply = ai_call_coach(user_q.strip())
             ai_add_message("assistant", reply)
-            # No need to modify session_state — input box clears because the key changed
-            
+            # No rerun; input clears because key changes next render
+
 
 # ------------------------
 # STREAMLIT APP
@@ -765,7 +764,7 @@ if page == "Today":
         "mode": mode,
     }
 
-    # Cardio
+    # Cardio & TCX
     tcx_data = None
     cardio_mode = ""
     cardio_duration = 0
@@ -773,7 +772,21 @@ if page == "Today":
     cardio_avg_hr = ""
     cardio_rpe = 0
 
-    if kind in ["Tempo", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
+    # Determine if day is inherently a cardio day (plan-based)
+    cardio_kinds = ["Tempo", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]
+    is_plan_cardio_day = kind in cardio_kinds
+
+    log_cardio_manual = False
+    show_cardio_section = False
+
+    # Option A behavior: on Manual days, only show cardio (and TCX) if user chooses to add cardio
+    if kind == "Manual":
+        log_cardio_manual = st.checkbox("Add a cardio session today?", value=False)
+        show_cardio_section = log_cardio_manual
+    else:
+        show_cardio_section = is_plan_cardio_day
+
+    if show_cardio_section:
         st.markdown("### Cardio Log")
         cardio_mode = st.selectbox("Cardio mode", CARDIO_MODES, index=0)
         cardio_duration = st.number_input("Cardio duration (min)", min_value=0, max_value=600, value=0)
@@ -842,7 +855,7 @@ if page == "Today":
         log_data["strength_block"] = ""
 
     # Finalize cardio fields
-    if kind in ["Tempo", "FlexCardio", "LongZ2", "Incline", "ME", "TriBrick", "TriRaceLike"]:
+    if show_cardio_section:
         if tcx_data:
             duration_min = int(tcx_data["duration_sec"] / 60)
             distance_mi = round(tcx_data["distance_m"] / 1609.34, 2) if tcx_data["distance_m"] > 0 else 0.0
