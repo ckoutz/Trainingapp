@@ -1,9 +1,13 @@
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, date
 import streamlit as st
 
-st.set_page_config(page_title="Training Planner + Coach", layout="wide")
+# =====================
+# CONFIG
+# =====================
+
+st.set_page_config(page_title="Training Planner", layout="wide")
 
 DAYS_OF_WEEK = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
@@ -33,45 +37,113 @@ STRENGTH_EXERCISES = {
 
 CARDIO_TYPES = ["Run", "Bike", "Walk", "Row", "Swim", "Other"]
 
+N_WEEKS_DEFAULT = 24  # how many weeks to keep in memory
 
-def default_workout(day_index: int) -> dict:
-    """Return a default rest day workout object."""
+
+# =====================
+# DATA MODEL
+# =====================
+
+def default_day(week_index: int, day_index: int) -> dict:
     return {
-        "id": f"day-{day_index}",
+        "week_index": week_index,
         "day_index": day_index,
+        "id": f"w{week_index}-d{day_index}",
         "primary_type": "rest",  # "cardio" | "strength" | "rest"
         "primary_cardio": None,  # {type, duration_min, distance_km}
-        "primary_strength": [],  # list of strength blocks
+        "primary_strength": [],  # list of {category, exercise, sets, reps}
         "addons": {
-            "cardio": [],  # list of cardio add-ons
-            "strength": [],  # list of strength add-ons
+            "cardio": [],   # list of cardio add-ons
+            "strength": [], # list of strength add-ons
         },
         "notes": "",
+        "is_work_day": False,
     }
 
 
 def init_session_state():
-    if "plan" not in st.session_state:
-        st.session_state.plan = [default_workout(i) for i in range(7)]
-    if "selected_day" not in st.session_state:
-        st.session_state.selected_day = 0
+    if "plan_weeks" not in st.session_state:
+        st.session_state.plan_weeks = [
+            [default_day(w, d) for d in range(7)] for w in range(N_WEEKS_DEFAULT)
+        ]
+
+    if "plan_start_date" not in st.session_state:
+        # Week 1 starts on the Monday of current week
+        today = date.today()
+        monday = today - timedelta(days=today.weekday())
+        st.session_state.plan_start_date = monday
+
+    if "current_week_index" not in st.session_state:
+        st.session_state.current_week_index = 0
+
+    if "selected_day_index" not in st.session_state:
+        st.session_state.selected_day_index = datetime.today().weekday()
+
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
 
+    if "settings" not in st.session_state:
+        st.session_state.settings = {
+            "units": "km",  # or "mi"
+            "default_cardio_duration": 45,
+        }
+
+
+def get_week_label(week_index: int) -> str:
+    start_date: date = st.session_state.plan_start_date + timedelta(weeks=week_index)
+    end_date: date = start_date + timedelta(days=6)
+    # Example: "Week 3 — Feb 03–Feb 09"
+    start_str = start_date.strftime("%b %d")
+    end_str = end_date.strftime("%b %d")
+    return f"Week {week_index + 1} — {start_str}–{end_str}"
+
+
+def summarize_workout(day: dict) -> str:
+    primary_type = day.get("primary_type", "rest")
+    parts = []
+
+    if primary_type == "cardio" and day.get("primary_cardio"):
+        c = day["primary_cardio"]
+        s = f"{c['type']} {c['duration_min']}min"
+        if c.get("distance_km"):
+            s += f", {c['distance_km']}km"
+        parts.append(s)
+    elif primary_type == "strength" and day.get("primary_strength"):
+        cats = {blk["category"] for blk in day["primary_strength"] if blk.get("category")}
+        if cats:
+            parts.append("Strength: " + ", ".join(sorted(cats)))
+        else:
+            parts.append("Strength")
+    else:
+        parts.append("Rest")
+
+    addons = day.get("addons", {})
+    addon_bits = []
+    if addons.get("cardio"):
+        addon_bits.append(f"+{len(addons['cardio'])} cardio add-on(s)")
+    if addons.get("strength"):
+        addon_bits.append(f"+{len(addons['strength'])} strength add-on(s)")
+    if addon_bits:
+        parts.append(" / " + " & ".join(addon_bits))
+
+    if day.get("is_work_day"):
+        parts.append(" / Work")
+
+    return "".join(parts)
+
+
+# =====================
+# UI HELPERS
+# =====================
 
 def strength_block_ui(prefix: str, idx: int, default_block: dict | None):
-    """Render inputs for a single strength block and return the resulting dict or None.
-    prefix: unique prefix per context (e.g. 'primary', 'addon')
-    idx: index inside that context
-    default_block: existing data or None
-    """
     key_base = f"{prefix}_strength_{idx}"
     default_category = (default_block or {}).get("category", "None")
     default_exercise = (default_block or {}).get("exercise", "None")
     default_sets = (default_block or {}).get("sets", 3)
     default_reps = (default_block or {}).get("reps", 10)
 
-    col1, col2, col3, col4 = st.columns([1.2, 1.2, 0.7, 0.7])
+    col1, col2, col3, col4 = st.columns([1.4, 1.4, 0.8, 0.8])
     with col1:
         category = st.selectbox(
             "Category",
@@ -118,13 +190,12 @@ def strength_block_ui(prefix: str, idx: int, default_block: dict | None):
 
 
 def cardio_block_ui(prefix: str, default_block: dict | None):
-    """Render inputs for a cardio block and return resulting dict or None."""
     key_base = f"{prefix}_cardio"
     default_type = (default_block or {}).get("type", "Run")
-    default_duration = (default_block or {}).get("duration_min", 30)
+    default_duration = (default_block or {}).get("duration_min", st.session_state.settings["default_cardio_duration"])
     default_distance = (default_block or {}).get("distance_km", 0.0)
 
-    col1, col2, col3 = st.columns([1.2, 0.8, 0.8])
+    col1, col2, col3 = st.columns([1.4, 1.0, 1.0])
     with col1:
         ctype = st.selectbox(
             "Cardio Type",
@@ -137,7 +208,7 @@ def cardio_block_ui(prefix: str, default_block: dict | None):
             "Duration (min)",
             min_value=0,
             max_value=300,
-            value=int(default_duration) if isinstance(default_duration, (int, float)) else 30,
+            value=int(default_duration) if isinstance(default_duration, (int, float)) else 45,
             step=5,
             key=f"{key_base}_duration",
         )
@@ -161,230 +232,361 @@ def cardio_block_ui(prefix: str, default_block: dict | None):
     }
 
 
-def summarize_workout(day: dict) -> str:
-    primary_type = day.get("primary_type", "rest")
-    summary_parts = []
+def day_editor(week_index: int, day_index: int, compact: bool = False):
+    day = st.session_state.plan_weeks[week_index][day_index]
+    prefix = f"w{week_index}_d{day_index}"
 
-    if primary_type == "cardio" and day.get("primary_cardio"):
-        c = day["primary_cardio"]
-        part = f"{c['type']} {c['duration_min']}min"
-        if c.get("distance_km"):
-            part += f", {c['distance_km']}km"
-        summary_parts.append(part)
-    elif primary_type == "strength" and day.get("primary_strength"):
-        cats = {blk["category"] for blk in day["primary_strength"] if blk.get("category")}
-        if cats:
-            summary_parts.append("Strength: " + ", ".join(sorted(cats)))
-        else:
-            summary_parts.append("Strength")
+    if not compact:
+        st.markdown(f"### {DAYS_OF_WEEK[day_index]} — {get_week_label(week_index)}")
     else:
-        summary_parts.append("Rest")
+        st.markdown(f"**Edit {DAYS_OF_WEEK[day_index]} ({get_week_label(week_index)})**")
 
-    addons = day.get("addons", {})
-    addon_strs = []
-    if addons.get("cardio"):
-        addon_strs.append(f"+{len(addons['cardio'])} cardio add-on(s)")
-    if addons.get("strength"):
-        addon_strs.append(f"+{len(addons['strength'])} strength add-on(s)")
-
-    if addon_strs:
-        summary_parts.append(" / " + " & ".join(addon_strs))
-
-    return "".join(summary_parts) if summary_parts else "Rest"
-
-
-def weekly_overview():
-    st.subheader("📆 Weekly Schedule")
-    plan = st.session_state.plan
-
-    cols = st.columns(7)
-    for i, col in enumerate(cols):
-        with col:
-            day = plan[i]
-            st.markdown(f"**{DAYS_OF_WEEK[i]}**")
-            st.caption(summarize_workout(day))
-
-
-def reorder_section():
-    st.markdown("---")
-    with st.expander("🔀 Shuffle / Reorder workouts this week"):
-        plan = st.session_state.plan
-        st.write(
-            "Assign which existing workout should go to each day. "
-            "If you pick the same source day more than once, that workout will be duplicated."
-        )
-
-        options = list(range(7))
-        labels = [f"{DAYS_OF_WEEK[i]}: {summarize_workout(plan[i])}" for i in options]
-
-        mapping = {}
-        for i, day_name in enumerate(DAYS_OF_WEEK):
-            mapping[i] = st.selectbox(
-                f"{day_name} gets workout from:",
-                options=options,
-                format_func=lambda x, labels=labels: labels[x],
-                index=i,
-                key=f"reorder_{i}",
-            )
-
-        if st.button("Apply Reorder"):
-            new_plan = []
-            for dest_day in range(7):
-                src_idx = mapping[dest_day]
-                src_day = plan[src_idx]
-                # Create a shallow copy but update day_index
-                copied = json.loads(json.dumps(src_day))
-                copied["day_index"] = dest_day
-                copied["id"] = f"day-{dest_day}"
-                new_plan.append(copied)
-            st.session_state.plan = new_plan
-            st.success("Reordered workouts for this week.")
-
-
-def edit_manual_section():
-    st.markdown("---")
-    st.subheader("✏️ Edit / Manual Workout Entry")
-
-    day_idx = st.selectbox(
-        "Select day to edit",
-        options=list(range(7)),
-        format_func=lambda i: DAYS_OF_WEEK[i],
-        index=st.session_state.selected_day,
+    primary_type = st.radio(
+        "Primary workout type",
+        options=["cardio", "strength", "rest"],
+        index=["cardio", "strength", "rest"].index(day.get("primary_type", "rest")),
+        horizontal=True,
+        key=f"{prefix}_primary_type",
     )
-    st.session_state.selected_day = day_idx
-    day = st.session_state.plan[day_idx]
 
-    with st.form("edit_workout_form"):
-        st.markdown(f"### {DAYS_OF_WEEK[day_idx]}")
+    primary_cardio = None
+    primary_strength_blocks = []
 
-        primary_type = st.radio(
-            "Primary workout type",
-            options=["cardio", "strength", "rest"],
-            index=["cardio", "strength", "rest"].index(day.get("primary_type", "rest")),
-            horizontal=True,
+    if primary_type == "cardio":
+        st.markdown("**Primary Cardio**")
+        primary_cardio = cardio_block_ui(prefix=f"{prefix}_primary", default_block=day.get("primary_cardio"))
+    elif primary_type == "strength":
+        st.markdown("**Primary Strength Blocks**")
+        existing_blocks = day.get("primary_strength") or []
+        max_blocks = 4
+        for i in range(max_blocks):
+            st.markdown(f"Block {i + 1}")
+            default_block = existing_blocks[i] if i < len(existing_blocks) else None
+            blk = strength_block_ui(prefix=f"{prefix}_primary", idx=i, default_block=default_block)
+            if blk:
+                primary_strength_blocks.append(blk)
+            st.markdown("---")
+
+    addons_cardio = []
+    addons_strength = []
+
+    with st.expander("➕ Cardio Add-On (optional)"):
+        include_cardio_addon = st.checkbox(
+            "Include a cardio add-on",
+            value=bool(day.get("addons", {}).get("cardio")),
+            key=f"{prefix}_addon_cardio_toggle",
         )
+        if include_cardio_addon:
+            existing_cardio_addons = day.get("addons", {}).get("cardio") or []
+            primary_addon = existing_cardio_addons[0] if existing_cardio_addons else None
+            addon = cardio_block_ui(prefix=f"{prefix}_addon", default_block=primary_addon)
+            if addon:
+                addons_cardio.append(addon)
 
-        primary_cardio = None
-        primary_strength_blocks = []
-
-        if primary_type == "cardio":
-            st.markdown("**Primary Cardio**")
-            primary_cardio = cardio_block_ui(
-                prefix=f"primary_{day_idx}",
-                default_block=day.get("primary_cardio"),
-            )
-        elif primary_type == "strength":
-            st.markdown("**Primary Strength Blocks**")
-            existing_blocks = day.get("primary_strength") or []
-            max_blocks = 4
-            for i in range(max_blocks):
-                st.markdown(f"Block {i + 1}")
-                default_block = existing_blocks[i] if i < len(existing_blocks) else None
-                blk = strength_block_ui(prefix=f"primary_{day_idx}", idx=i, default_block=default_block)
+    with st.expander("➕ Strength Add-On (optional)"):
+        include_strength_addon = st.checkbox(
+            "Include a strength add-on",
+            value=bool(day.get("addons", {}).get("strength")),
+            key=f"{prefix}_addon_strength_toggle",
+        )
+        if include_strength_addon:
+            st.markdown("You can define up to 3 additional strength blocks.")
+            existing_strength_addons = day.get("addons", {}).get("strength") or []
+            max_addon_blocks = 3
+            for i in range(max_addon_blocks):
+                st.markdown(f"Add-on Block {i + 1}")
+                default_block = existing_strength_addons[i] if i < len(existing_strength_addons) else None
+                blk = strength_block_ui(prefix=f"{prefix}_addon", idx=i, default_block=default_block)
                 if blk:
-                    primary_strength_blocks.append(blk)
+                    addons_strength.append(blk)
                 st.markdown("---")
 
-        addons_cardio = []
-        addons_strength = []
+    notes = st.text_area("Notes (optional)", value=day.get("notes", ""), key=f"{prefix}_notes")
 
-        with st.expander("➕ Cardio Add-On (optional)"):
-            include_cardio_addon = st.checkbox(
-                "Include a cardio add-on",
-                value=bool(day.get("addons", {}).get("cardio")),
-                key=f"addon_cardio_toggle_{day_idx}",
-            )
-            if include_cardio_addon:
-                existing_cardio_addons = day.get("addons", {}).get("cardio") or []
-                primary_addon = existing_cardio_addons[0] if existing_cardio_addons else None
-                addon = cardio_block_ui(prefix=f"addon_{day_idx}", default_block=primary_addon)
-                if addon:
-                    addons_cardio.append(addon)
+    colw1, colw2 = st.columns(2)
+    with colw1:
+        is_work_day = st.checkbox(
+            "Mark as work day",
+            value=day.get("is_work_day", False),
+            key=f"{prefix}_is_work_day",
+        )
+    with colw2:
+        save_clicked = st.button("Save Day", key=f"{prefix}_save")
 
-        with st.expander("➕ Strength Add-On (optional)"):
-            include_strength_addon = st.checkbox(
-                "Include a strength add-on",
-                value=bool(day.get("addons", {}).get("strength")),
-                key=f"addon_strength_toggle_{day_idx}",
-            )
-            if include_strength_addon:
-                st.markdown("You can define up to 3 additional strength blocks.")
-                existing_strength_addons = day.get("addons", {}).get("strength") or []
-                max_addon_blocks = 3
-                for i in range(max_addon_blocks):
-                    st.markdown(f"Add-on Block {i + 1}")
-                    default_block = existing_strength_addons[i] if i < len(existing_strength_addons) else None
-                    blk = strength_block_ui(prefix=f"addon_{day_idx}", idx=i, default_block=default_block)
-                    if blk:
-                        addons_strength.append(blk)
-                    st.markdown("---")
+    if save_clicked:
+        updated = default_day(week_index, day_index)
+        updated["primary_type"] = primary_type
+        updated["notes"] = notes
+        updated["is_work_day"] = is_work_day
 
-        notes = st.text_area("Notes (optional)", value=day.get("notes", ""))
+        if primary_type == "cardio" and primary_cardio:
+            updated["primary_cardio"] = primary_cardio
+        elif primary_type == "strength" and primary_strength_blocks:
+            updated["primary_strength"] = primary_strength_blocks
 
-        submitted = st.form_submit_button("Save Day")
-        if submitted:
-            updated = default_workout(day_idx)
-            updated["primary_type"] = primary_type
-            updated["notes"] = notes
+        updated["addons"] = {
+            "cardio": addons_cardio,
+            "strength": addons_strength,
+        }
 
-            if primary_type == "cardio" and primary_cardio:
-                updated["primary_cardio"] = primary_cardio
-            elif primary_type == "strength" and primary_strength_blocks:
-                updated["primary_strength"] = primary_strength_blocks
-
-            updated["addons"] = {
-                "cardio": addons_cardio,
-                "strength": addons_strength,
-            }
-
-            st.session_state.plan[day_idx] = updated
-            st.success(f"Saved workout for {DAYS_OF_WEEK[day_idx]}.")
+        st.session_state.plan_weeks[week_index][day_index] = updated
+        st.success(f"Saved workout for {DAYS_OF_WEEK[day_index]} ({get_week_label(week_index)}).")
 
 
-def coach_chat_section():
+# =====================
+# PAGES
+# =====================
+
+def page_today():
+    st.title("Today")
+
+    today = date.today()
+    start_date: date = st.session_state.plan_start_date
+    delta_days = (today - start_date).days
+
+    if delta_days < 0:
+        week_index = 0
+        day_index = 0
+    else:
+        week_index = min(delta_days // 7, N_WEEKS_DEFAULT - 1)
+        day_index = min(delta_days % 7, 6)
+
+    day = st.session_state.plan_weeks[week_index][day_index]
+
+    st.caption(get_week_label(week_index))
+    st.subheader(f"{DAYS_OF_WEEK[day_index]}")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        st.markdown("#### Summary")
+        st.write(summarize_workout(day))
+
+        with st.expander("Edit today's workout"):
+            day_editor(week_index, day_index, compact=True)
+
+    with col2:
+        st.markdown("#### TCX Upload (today)")
+        uploaded = st.file_uploader("Upload TCX for today", type=["tcx"], key="tcx_today")
+        if uploaded is not None:
+            parse_and_show_tcx(uploaded)
+
     st.markdown("---")
-    st.subheader("🤖 AI Coach (simple stub)")
-    st.caption(
-        "This is a basic chat UI. Wire it up to your preferred model/API inside the handle_coach_reply() function."
-    )
+    st.markdown("#### Coach (stub)")
 
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    prompt = st.chat_input("Ask your coach something about your training...")
+    prompt = st.chat_input("Ask your coach...")
     if prompt:
         st.session_state.chat_history.append({"role": "user", "content": prompt})
-        # Placeholder coach reply:
-        reply = handle_coach_reply(prompt)
+        reply = handle_coach_reply(prompt, day, week_index)
         st.session_state.chat_history.append({"role": "assistant", "content": reply})
         st.experimental_rerun()
 
 
-def handle_coach_reply(prompt: str) -> str:
-    """Stub for AI coach logic. Replace with a real model call if you want.
+def page_this_week():
+    st.title("This Week")
 
-    You can import openai / other SDK here and use your API key from environment.
-    This stub keeps the file self-contained and runnable without extra setup.
-    """
-    return (
-        "I'm a placeholder coach for now. Once you connect me to a real model, "
-        "I can analyze your plan, TCX data, and history in detail. "
-        "For now, tell me what type of feedback you want most (pacing, volume, recovery, etc.)."
+    week_index = st.selectbox(
+        "Select week",
+        options=list(range(N_WEEKS_DEFAULT)),
+        index=st.session_state.current_week_index,
+        format_func=get_week_label,
+        key="week_selector",
+    )
+    st.session_state.current_week_index = week_index
+
+    week_days = st.session_state.plan_weeks[week_index]
+
+    st.markdown("### Week Overview")
+    cols = st.columns(7)
+    for i, col in enumerate(cols):
+        with col:
+            day = week_days[i]
+            st.markdown(f"**{DAYS_OF_WEEK[i][:3]}**")
+            st.caption(summarize_workout(day))
+            if st.button("Edit", key=f"edit_w{week_index}_d{i}"):
+                st.session_state.selected_day_index = i
+
+    st.markdown("---")
+    st.markdown("### Edit Selected Day")
+
+    day_index = st.session_state.selected_day_index
+    day_editor(week_index, day_index)
+
+    st.markdown("---")
+    st.markdown("### Shuffle / Reorder This Week")
+    with st.expander("Shuffle workouts within this week"):
+        options = list(range(7))
+        labels = [f"{DAYS_OF_WEEK[i]}: {summarize_workout(week_days[i])}" for i in options]
+        mapping = {}
+        for i in range(7):
+            mapping[i] = st.selectbox(
+                f"{DAYS_OF_WEEK[i]} gets workout from:",
+                options=options,
+                format_func=lambda x, labels=labels: labels[x],
+                index=i,
+                key=f"reorder_w{week_index}_d{i}",
+            )
+
+        if st.button("Apply Shuffle", key=f"shuffle_apply_w{week_index}"):
+            new_week = []
+            for dest_day in range(7):
+                src_idx = mapping[dest_day]
+                src_day = week_days[src_idx]
+                copied = json.loads(json.dumps(src_day))
+                copied["day_index"] = dest_day
+                copied["id"] = f"w{week_index}-d{dest_day}"
+                new_week.append(copied)
+            st.session_state.plan_weeks[week_index] = new_week
+            st.success("Week reordered.")
+
+
+def page_work_schedule():
+    st.title("Work Schedule")
+
+    st.markdown(
+        "Mark work days or apply a simple 7-on / 7-off pattern across all weeks. "
+        "Work days will be visible in your weekly and today views."
+    )
+
+    pattern = st.radio(
+        "Pattern helper (optional)",
+        options=["None", "7-on / 7-off (starting Week 1, Monday)"],
+        index=0,
+        horizontal=True,
+    )
+
+    if pattern != "None":
+        if st.button("Apply pattern to all weeks"):
+            for w in range(N_WEEKS_DEFAULT):
+                # 7 on (week 1), 7 off (week 2), repeat
+                on_block = (w % 2 == 0)
+                for d in range(7):
+                    st.session_state.plan_weeks[w][d]["is_work_day"] = on_block
+            st.success("Applied 7-on / 7-off pattern to all weeks.")
+
+    st.markdown("---")
+    st.markdown("### Edit work days for a specific week")
+
+    week_index = st.selectbox(
+        "Select week to edit",
+        options=list(range(N_WEEKS_DEFAULT)),
+        index=st.session_state.current_week_index,
+        format_func=get_week_label,
+        key="work_week_selector",
+    )
+    st.session_state.current_week_index = week_index
+
+    cols = st.columns(7)
+    week_days = st.session_state.plan_weeks[week_index]
+    for i, col in enumerate(cols):
+        with col:
+            day = week_days[i]
+            st.markdown(f"**{DAYS_OF_WEEK[i][:3]}**")
+            is_work = st.checkbox(
+                "Work",
+                value=day.get("is_work_day", False),
+                key=f"work_w{week_index}_d{i}",
+            )
+            day["is_work_day"] = is_work
+
+    st.info(
+        "Work flags are saved immediately. You can fine-tune training intensity on work days from the "
+        "'This Week' page by editing each day."
     )
 
 
-def tcx_upload_section():
+def page_phase():
+    st.title("Phase Overview")
+
+    current_week = st.session_state.current_week_index
+    total_weeks = N_WEEKS_DEFAULT
+
+    # Simple example phase logic: 1–8 = Phase 1, 9–16 = Phase 2, etc.
+    if current_week < 8:
+        phase = "Phase 1 (Base)"
+    elif current_week < 16:
+        phase = "Phase 2 (Build)"
+    else:
+        phase = "Phase 3 (Peak)"
+    st.subheader(f"Current Phase: {phase}")
+
+    st.markdown(
+        "- **Phase 1 (Base)**: Emphasis on easy Zone 2, basic strength technique, and building consistency.\n"
+        "- **Phase 2 (Build)**: More tempo/threshold work, heavier strength, and specific hill sessions.\n"
+        "- **Phase 3 (Peak)**: Sharper intensity, race-specific prep, and strategic deloads."
+    )
+
     st.markdown("---")
-    st.subheader("📁 Upload a TCX file (optional)")
-    st.caption("Quick-and-dirty summary so the coach can eventually learn from your real workouts.")
+    st.markdown("### Weekly Snapshot")
 
-    uploaded = st.file_uploader("Upload TCX", type=["tcx"])
-    if not uploaded:
-        return
+    cols = st.columns(3)
+    with cols[0]:
+        st.metric("Current week", current_week + 1)
+    with cols[1]:
+        st.metric("Total weeks in plan (in memory)", total_weeks)
+    with cols[2]:
+        st.metric("Weeks remaining", max(total_weeks - (current_week + 1), 0))
 
+    st.markdown("---")
+    st.markdown("### Debug / Raw Plan Data (optional)")
+    with st.expander("Show raw JSON for all weeks"):
+        st.code(json.dumps(st.session_state.plan_weeks, indent=2), language="json")
+
+
+def page_settings():
+    st.title("Settings")
+
+    settings = st.session_state.settings
+
+    units = st.radio(
+        "Distance units",
+        options=["km", "mi"],
+        index=["km", "mi"].index(settings.get("units", "km")),
+        horizontal=True,
+    )
+    settings["units"] = units
+
+    default_duration = st.number_input(
+        "Default cardio duration (min)",
+        min_value=10,
+        max_value=180,
+        value=int(settings.get("default_cardio_duration", 45)),
+        step=5,
+    )
+    settings["default_cardio_duration"] = int(default_duration)
+
+    st.session_state.settings = settings
+
+    st.markdown("---")
+    st.markdown("### Export / Import Plan (manual)")
+
+    st.markdown("**Export current plan JSON**")
+    st.code(json.dumps(st.session_state.plan_weeks, indent=2), language="json")
+
+    st.markdown("**Import plan JSON**")
+    uploaded = st.file_uploader("Upload JSON exported from this app", type=["json"], key="import_json")
+    if uploaded is not None:
+        try:
+            data = json.loads(uploaded.read().decode("utf-8"))
+            if isinstance(data, list):
+                st.session_state.plan_weeks = data
+                st.success("Imported plan JSON.")
+            else:
+                st.error("JSON format not recognized. Expected a list.")
+        except Exception as e:
+            st.error(f"Failed to import JSON: {e}")
+
+
+# =====================
+# TCX PARSER
+# =====================
+
+def parse_and_show_tcx(uploaded_file):
     try:
-        content = uploaded.read().decode("utf-8")
+        content = uploaded_file.read().decode("utf-8")
     except Exception:
         st.error("Could not read TCX file. Make sure it's a valid text-based .tcx file.")
         return
@@ -415,11 +617,10 @@ def tcx_upload_section():
                 except ValueError:
                     pass
 
-        distance_km = total_distance / 1000.0 if total_distance else 0
-        duration_min = total_time / 60.0 if total_time else 0
+        distance_km = total_distance / 1000.0 if total_distance else 0.0
+        duration_min = total_time / 60.0 if total_time else 0.0
         avg_hr = sum(hr_values) / len(hr_values) if hr_values else None
 
-        st.write("**Parsed Summary**")
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Distance (km)", f"{distance_km:.2f}")
@@ -435,23 +636,44 @@ def tcx_upload_section():
         st.error(f"Failed to parse TCX: {e}")
 
 
+# =====================
+# COACH STUB
+# =====================
+
+def handle_coach_reply(prompt: str, today_day: dict, week_index: int) -> str:
+    """Very simple stub that at least is aware of today's workout and week index."""
+    summary = summarize_workout(today_day)
+    label = get_week_label(week_index)
+    return (
+        f"You're in {label}. Today's planned work is: {summary}.\n\n"
+        "I'm a placeholder coach for now, but I can already see your structure. "
+        "Use the 'This Week' page to make sure you have a sensible mix of easy and hard days, "
+        "and try to keep hard days away from the heaviest work days.")
+
+
+# =====================
+# MAIN
+# =====================
+
 def main():
     init_session_state()
 
-    st.title("Training Planner")
-    st.caption(
-        "Plan your week, shuffle workouts freely, enter manual days, and attach optional strength/cardio "
-        "to any day — plus a stub AI coach and TCX upload."
+    st.sidebar.title("Training Planner")
+    page = st.sidebar.radio(
+        "Navigate",
+        options=["Today", "This Week", "Work Schedule", "Phase", "Settings"],
     )
 
-    weekly_overview()
-    reorder_section()
-    edit_manual_section()
-    tcx_upload_section()
-    coach_chat_section()
-
-    with st.expander("📦 Export / Debug data"):
-        st.code(json.dumps(st.session_state.plan, indent=2), language="json")
+    if page == "Today":
+        page_today()
+    elif page == "This Week":
+        page_this_week()
+    elif page == "Work Schedule":
+        page_work_schedule()
+    elif page == "Phase":
+        page_phase()
+    elif page == "Settings":
+        page_settings()
 
 
 if __name__ == "__main__":
