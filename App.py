@@ -689,7 +689,7 @@ def render_ai_coach_panel():
             reply = ai_call_coach(user_q.strip())
             ai_add_message("assistant", reply)
             # No need to modify session_state — input box clears because the key changed
-            st.experimental_rerun()
+            
 
 # ------------------------
 # STREAMLIT APP
